@@ -297,6 +297,22 @@ class MOMENT(nn.Module):
         x_enc = torch.nan_to_num(x_enc, nan=0, posinf=0, neginf=0)
 
         x_enc = self.tokenizer(x=x_enc)
+
+
+
+        #######################################################################
+        if not isinstance(self.patch_embedding.value_embedding, nn.Linear):
+            # using prompt tuning
+            mask = torch.concatenate([torch.ones(mask.size(0),
+                                                self.patch_len*self.patch_embedding.value_embedding.n_tokens).to(x_enc.device),
+                                        mask], dim=1)
+            input_mask = torch.concatenate([torch.ones(input_mask.size(0),
+                                                        self.patch_len*self.patch_embedding.value_embedding.n_tokens).to(x_enc.device),
+                                            input_mask], dim=1)
+        #######################################################################
+
+
+
         enc_in = self.patch_embedding(x_enc, mask=mask)
 
         n_patches = enc_in.shape[2]
@@ -326,6 +342,14 @@ class MOMENT(nn.Module):
         else:
             illegal_output = None
 
+
+        #######################################################################
+        if not isinstance(self.patch_embedding.value_embedding, nn.Linear):
+            # using prompt tuning
+            dec_out = dec_out[:, :, self.patch_len*self.patch_embedding.value_embedding.n_tokens:]
+        #######################################################################
+
+
         return TimeseriesOutputs(
             input_mask=input_mask,
             reconstruction=dec_out,
@@ -347,6 +371,7 @@ class MOMENT(nn.Module):
         x_enc = self.normalizer(x=x_enc, mask=mask * input_mask, mode="norm")
 
         x_enc = self.tokenizer(x=x_enc)
+
         enc_in = self.patch_embedding(x_enc, mask=mask)
 
         n_patches = enc_in.shape[2]
@@ -419,6 +444,15 @@ class MOMENT(nn.Module):
         x_enc = torch.nan_to_num(x_enc, nan=0, posinf=0, neginf=0)
 
         x_enc = self.tokenizer(x=x_enc)
+
+        #######################################################################
+        if not isinstance(self.patch_embedding.value_embedding, nn.Linear):
+            # using prompt tuning
+            input_mask = torch.concatenate([torch.ones(input_mask.size(0),
+                                                       self.patch_len*self.patch_embedding.value_embedding.n_tokens).to(x_enc.device),
+                                            input_mask], dim=1)
+        #######################################################################
+
         enc_in = self.patch_embedding(x_enc, mask=torch.ones_like(input_mask))
 
         n_patches = enc_in.shape[2]
@@ -529,7 +563,7 @@ class MOMENT(nn.Module):
         # Mean across channels
         if reduction == "mean":
             # [batch_size x n_patches x d_model]
-            enc_out = enc_out.mean(dim=1, keepdim=False)  
+            enc_out = enc_out.mean(dim=1, keepdim=False)
         # Concatenate across channels
         elif reduction == "concat":
             # [batch_size x n_patches x d_model * n_channels]
