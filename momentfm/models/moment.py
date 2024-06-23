@@ -8,6 +8,7 @@ import torch
 from huggingface_hub import PyTorchModelHubMixin
 from torch import nn
 from transformers import T5Config, T5EncoderModel, T5Model
+from transformers.models.t5.modeling_t5 import T5Stack
 
 from momentfm.common import TASKS
 from momentfm.data.base import TimeseriesOutputs
@@ -228,29 +229,36 @@ class MOMENT(nn.Module):
 
         transformer_backbone = transformer_backbone.get_encoder()
 
+        model_config = transformer_backbone.config
 
         if config.getattr("enable_gradient_checkpointing", True):
             transformer_backbone.gradient_checkpointing_enable()
             logging.info("Enabling gradient checkpointing.")
 
-
         #######################################################################
+        # prefix tuning
         if config.getattr("prefix-tuning", False):
             logging.info("Using prefix tuning.")
             # transformer_backbone = RobertaModel.from_pretrained("FacebookAI/roberta-base") # this is encoder only I think
 
-            # TODO: use pretrained?
             model_config = T5Config.from_pretrained(config.transformer_backbone)
-            setattr(T5Config, 'num_prefix', 2)
-            setattr(T5Config, 'reparam', True)
-            setattr(T5Config, 'reparam_dim', 32)
-            setattr(T5Config, 'no_decoder_self_attn', False) # TODO
+            setattr(model_config, 'num_prefix', 2)
+            setattr(model_config, 'reparam', True)
+            setattr(model_config, 'reparam_dim', 32)
+            setattr(model_config, 'no_decoder_self_attn', False) # TODO
             transformer_backbone = T5ForConditionalGenerationWithPrefix(model_config)
-            transformer_backbone = transformer_backbone.from_pretrained(config.transformer_backbone).encoder
+            transformer_backbone = transformer_backbone.from_pretrained(config.transformer_backbone, config=model_config)
+            transformer_backbone.enable_input_require_grads()
+            transformer_backbone = transformer_backbone.encoder
+
+            # check whether the weights is loaded correctly
+            t5 = T5EncoderModel.from_pretrained(config.transformer_backbone).get_encoder()
+            for name, param in transformer_backbone.named_parameters():
+                if 'prefix' not in name:
+                    assert(torch.equal(param, t5.state_dict()[name]))
+                    
+            # TODO: gradient checkpointing for prefix tuning
             
-            # transformer_backbone.init_weights()
-            # T5ForConditionalGenerationWithPrefix(model_config).from_pretrained(config.transformer_backbone)
-            # T5ForConditionalGenerationWithPrefix(model_config)
         #######################################################################
 
 
@@ -329,8 +337,6 @@ class MOMENT(nn.Module):
 
         x_enc = self.tokenizer(x=x_enc)
 
-
-
         #######################################################################
         if not isinstance(self.patch_embedding.value_embedding, nn.Linear):
             # using prompt tuning
@@ -358,23 +364,19 @@ class MOMENT(nn.Module):
                 inputs_embeds=enc_in,
                 decoder_inputs_embeds=enc_in,
                 attention_mask=attention_mask,
-                #######################################################################
-                past_key_values=past_key_values
-                #######################################################################
             )
             raise NotImplementedError("Encoder-decoder not implemented for prefix T5 and roberta.")
         else:
-            if isinstance(self.encoder, T5EncoderModel) or isinstance(self.encoder, T5StackWithPrefix):
+            if isinstance(self.encoder, T5Stack) or isinstance(self.encoder, T5StackWithPrefix):
                 outputs = self.encoder(inputs_embeds=enc_in, attention_mask=attention_mask,)
             #######################################################################
             elif isinstance(self.encoder, RobertaModel):
-                # #######################################################################
-                # if 'past_key_values' in kwargs.keys():
+                assert 'past_key_values' in kwargs
                 past_key_values = kwargs['past_key_values']
+                assert past_key_values is not None
                 pre_seq_len = past_key_values[0].shape[3]
                 prefix_attention_mask = torch.ones(batch_size, pre_seq_len).to(attention_mask.device)
                 attention_mask = torch.cat((prefix_attention_mask, attention_mask), dim=1)
-                # #######################################################################  
                               
                 outputs = self.encoder(inputs_embeds=enc_in, # for roberta
                                     attention_mask=attention_mask,
@@ -382,7 +384,7 @@ class MOMENT(nn.Module):
                             )
             #######################################################################
             else:
-                raise NotImplementedError("Only T5 and Roberta are supported.")
+                raise NotImplementedError("Only T5 (prefix) and Roberta are supported.")
             
         enc_out = outputs.last_hidden_state
 
@@ -398,12 +400,11 @@ class MOMENT(nn.Module):
 
 
         #######################################################################
+        # if using prompt tuning
         if not isinstance(self.patch_embedding.value_embedding, nn.Linear):
-            # using prompt tuning
             dec_out = dec_out[:, :, self.patch_len*self.patch_embedding.value_embedding.n_tokens:]
-        #######################################################################
 
-        #######################################################################
+        # get embedding
         input_mask_patch_view = Masking.convert_seq_to_patch_view(
             input_mask, self.patch_len
         )
