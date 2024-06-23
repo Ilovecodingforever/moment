@@ -29,6 +29,15 @@ SUPPORTED_HUGGINGFACE_MODELS = [
 ]
 
 
+
+
+from momentfm.models.t5_with_prefix import T5ForConditionalGenerationWithPrefix, T5WithPrefixConfig, T5StackWithPrefix
+from transformers import RobertaModel
+
+
+
+
+
 class PretrainHead(nn.Module):
     def __init__(
         self,
@@ -216,37 +225,31 @@ class MOMENT(nn.Module):
             logging.info(
                 f"Initializing pre-trained transformer from {config.transformer_backbone}."
             )
-        
+
         transformer_backbone = transformer_backbone.get_encoder()
 
 
         if config.getattr("enable_gradient_checkpointing", True):
             transformer_backbone.gradient_checkpointing_enable()
             logging.info("Enabling gradient checkpointing.")
-            
-            
+
+
         #######################################################################
         if config.getattr("prefix-tuning", False):
             logging.info("Using prefix tuning.")
-            from transformers import BertPreTrainedModel, BertModel, RobertaPreTrainedModel, RobertaModel, RobertaConfig
-            
-            # config = RobertaConfig()
-            # setattr(config, 'num_attention_heads', 16)
-            # setattr(config, 'hidden_size', 1024)
-            # setattr(config, 'add_pooling_layer', False)  # TODO: why not
-            
-            transformer_backbone = RobertaModel.from_pretrained("FacebookAI/roberta-base")
-            # transformer_backbone = transformer_backbone.encoder
+            # transformer_backbone = RobertaModel.from_pretrained("FacebookAI/roberta-base") # this is encoder only I think
+
             # TODO: use pretrained?
-            # from momentfm.models.t5_with_prefix import T5ForConditionalGenerationWithPrefix, T5WithPrefixConfig, T5StackWithPrefix
-            # model_config = T5Config.from_pretrained(config.transformer_backbone)
-            # setattr(T5Config, 'num_prefix', 10)
-            # setattr(T5Config, 'reparam', True)
-            # setattr(T5Config, 'reparam_dim', 32)
-            # setattr(T5Config, 'no_decoder_self_attn', False) # TODO
-            # transformer_backbone = T5StackWithPrefix(model_config)
-            # transformer_backbone.init_weights()
+            model_config = T5Config.from_pretrained(config.transformer_backbone)
+            setattr(T5Config, 'num_prefix', 2)
+            setattr(T5Config, 'reparam', True)
+            setattr(T5Config, 'reparam_dim', 32)
+            setattr(T5Config, 'no_decoder_self_attn', False) # TODO
+            transformer_backbone = T5ForConditionalGenerationWithPrefix(model_config)
+            transformer_backbone = transformer_backbone.from_pretrained(config.transformer_backbone).encoder
             
+            # transformer_backbone.init_weights()
+            # T5ForConditionalGenerationWithPrefix(model_config).from_pretrained(config.transformer_backbone)
             # T5ForConditionalGenerationWithPrefix(model_config)
         #######################################################################
 
@@ -349,13 +352,6 @@ class MOMENT(nn.Module):
         patch_view_mask = Masking.convert_seq_to_patch_view(input_mask, self.patch_len)
         attention_mask = patch_view_mask.repeat_interleave(n_channels, dim=0)
 
-        # #######################################################################
-        if 'past_key_values' in kwargs.keys():
-            past_key_values = kwargs['past_key_values']
-            pre_seq_len = past_key_values[0].shape[3]
-            prefix_attention_mask = torch.ones(batch_size, pre_seq_len).to(attention_mask.device)
-            attention_mask = torch.cat((prefix_attention_mask, attention_mask), dim=1)
-        # #######################################################################
 
         if self.config.transformer_type == "encoder_decoder":
             outputs = self.encoder(
@@ -366,16 +362,28 @@ class MOMENT(nn.Module):
                 past_key_values=past_key_values
                 #######################################################################
             )
+            raise NotImplementedError("Encoder-decoder not implemented for prefix T5 and roberta.")
         else:
-            if isinstance(self.encoder, T5EncoderModel):
+            if isinstance(self.encoder, T5EncoderModel) or isinstance(self.encoder, T5StackWithPrefix):
                 outputs = self.encoder(inputs_embeds=enc_in, attention_mask=attention_mask,)
             #######################################################################
-            else:
+            elif isinstance(self.encoder, RobertaModel):
+                # #######################################################################
+                # if 'past_key_values' in kwargs.keys():
+                past_key_values = kwargs['past_key_values']
+                pre_seq_len = past_key_values[0].shape[3]
+                prefix_attention_mask = torch.ones(batch_size, pre_seq_len).to(attention_mask.device)
+                attention_mask = torch.cat((prefix_attention_mask, attention_mask), dim=1)
+                # #######################################################################  
+                              
                 outputs = self.encoder(inputs_embeds=enc_in, # for roberta
                                     attention_mask=attention_mask,
                                         past_key_values=past_key_values
                             )
             #######################################################################
+            else:
+                raise NotImplementedError("Only T5 and Roberta are supported.")
+            
         enc_out = outputs.last_hidden_state
 
         enc_out = enc_out.reshape((-1, n_channels, n_patches, self.config.d_model))
