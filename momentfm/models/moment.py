@@ -31,11 +31,96 @@ SUPPORTED_HUGGINGFACE_MODELS = [
 
 
 
+##############################
 
 from momentfm.models.t5_with_prefix import T5ForConditionalGenerationWithPrefix, T5WithPrefixConfig, T5StackWithPrefix
 from momentfm.models.t5_multivariate_prefix import T5StackWithPrefixMulti, T5ForConditionalGenerationWithPrefixMulti
-from transformers import RobertaModel
 
+
+
+class MPT(nn.Module):
+    """
+    multitask prompt tuning
+    """
+    def __init__(self,
+                wte: nn.Module,
+                tasks: list,
+                n_tokens: int = 10,
+                random_range: float = 0.5,
+                hidden_size: int = 64):
+        """appends learned embedding to
+
+        Args:
+            wte (nn.Embedding): original transformer word embedding
+            n_tokens (int, optional): number of tokens for task. Defaults to 10.
+            random_range (float, optional): range to init embedding (if not initialize from vocab).
+                            Defaults to 0.5.
+            initialize_from_vocab (bool, optional): initalizes from default vocab. Defaults to True.
+        """
+        super().__init__()
+        self.wte = wte
+        self.n_tokens = n_tokens
+
+        self.hidden_size = hidden_size
+
+        self.mlp = nn.Linear(self.hidden_size, wte.weight.size(0))
+
+        self.shared_prompt = nn.parameter.Parameter(self.initialize_embedding(n_tokens,
+                                                                               self.hidden_size,
+                                                                               random_range))
+
+        self.tasks = tasks
+        self.task_prompt = nn.ParameterDict({task: nn.ParameterDict({
+            'u': nn.parameter.Parameter(self.initialize_embedding(n_tokens,
+                                                                    1,
+                                                                    random_range)),
+            'v': nn.parameter.Parameter(self.initialize_embedding(1,
+                                                                    self.hidden_size,
+                                                                    random_range)),
+            }) for task in tasks})
+
+        self.task_name = None
+
+
+    def initialize_embedding(self,
+                             i: int,
+                             j: int,
+                             random_range: float = 0.5, ):
+        """initializes learned embedding
+        Args:
+            same as __init__
+        Returns:
+            torch.float: initialized using original schemes
+        """
+        return torch.FloatTensor(i, j).uniform_(-random_range, random_range)
+
+
+    def forward(self, tokens):
+        """run forward pass
+        Args:
+            tokens (torch.long): input tokens before encoding
+        Returns:
+            torch.float: encoding of text concatenated with learned task specifc embedding
+        """
+
+        task = self.task_name
+
+        input_embedding = self.wte(tokens)
+
+        u = self.task_prompt[task]['u']
+        v = self.task_prompt[task]['v']
+
+        learned_embedding = self.mlp(torch.matmul(u, v) * self.shared_prompt)
+
+        # n_batches x features x n_patches x embedding_size
+        learned_embedding = learned_embedding.repeat(input_embedding.size(0),
+                                                     input_embedding.size(1), 1, 1)
+
+        self.task_name = None
+
+        return torch.cat([learned_embedding, input_embedding], 2)
+
+##############################
 
 
 
@@ -133,6 +218,12 @@ class MOMENT(nn.Module):
         self.encoder = self._get_transformer_backbone(config)
         # self.head = self._get_head(self.task_name)
         ###################################
+        # multi-task prompt tuning
+        if config.getattr("MPT", False):
+            self.patch_embedding.value_embedding = MPT(self.patch_embedding.value_embedding,
+                                                        config.task_names,
+                                                        n_tokens=config.getattr("num_prefix", 2),)
+
         self.recon_head = self._get_head(TASKS.RECONSTRUCTION)
         # self.cls_head = self._get_head(TASKS.CLASSIFICATION)
         self.fore_head = self._get_head(TASKS.FORECASTING)
@@ -246,14 +337,13 @@ class MOMENT(nn.Module):
         # prefix tuning
         if config.getattr("prefix-tuning", False) or config.getattr("prefix-tuning-multi", False):
             logging.info("Using prefix tuning.")
-            # transformer_backbone = RobertaModel.from_pretrained("FacebookAI/roberta-base") # this is encoder only I think
 
             model_config = T5Config.from_pretrained(config.transformer_backbone)
-            setattr(model_config, 'num_prefix', 2)
+            setattr(model_config, 'num_prefix', self.config.getattr("num_prefix", 2))
             setattr(model_config, 'reparam', True)
             setattr(model_config, 'reparam_dim', 32)
             setattr(model_config, 'no_decoder_self_attn', False) # TODO
-            
+
             if config.getattr("prefix-tuning-multi", False):
                 transformer_backbone = T5ForConditionalGenerationWithPrefixMulti(model_config)
             elif config.getattr("prefix-tuning", False):
@@ -267,7 +357,7 @@ class MOMENT(nn.Module):
             for name, param in transformer_backbone.named_parameters():
                 if 'prefix' not in name and 'prompt' not in name:
                     assert(torch.equal(param, t5.state_dict()[name]))
-                    
+
             # gradient checkpointing for prefix tuning doesn't work:
             # past_key_value is always None with gradient checkpointing (from T5Stack source code)
         #######################################################################
@@ -370,32 +460,16 @@ class MOMENT(nn.Module):
 
 
         if self.config.transformer_type == "encoder_decoder":
-            outputs = self.encoder(
-                inputs_embeds=enc_in,
-                decoder_inputs_embeds=enc_in,
-                attention_mask=attention_mask,
-            )
-            raise NotImplementedError("Encoder-decoder not implemented for prefix T5 and roberta.")
+            # outputs = self.encoder(
+            #     inputs_embeds=enc_in,
+            #     decoder_inputs_embeds=enc_in,
+            #     attention_mask=attention_mask,
+            # )
+            raise NotImplementedError("Encoder-decoder not implemented for prefix T5.")
         else:
-            if isinstance(self.encoder, T5Stack) or isinstance(self.encoder, T5StackWithPrefix) or isinstance(self.encoder, T5StackWithPrefixMulti):
-                outputs = self.encoder(inputs_embeds=enc_in, attention_mask=attention_mask,)
-            #######################################################################
-            elif isinstance(self.encoder, RobertaModel):
-                assert 'past_key_values' in kwargs
-                past_key_values = kwargs['past_key_values']
-                assert past_key_values is not None
-                pre_seq_len = past_key_values[0].shape[3]
-                prefix_attention_mask = torch.ones(batch_size, pre_seq_len).to(attention_mask.device)
-                attention_mask = torch.cat((prefix_attention_mask, attention_mask), dim=1)
-                              
-                outputs = self.encoder(inputs_embeds=enc_in, # for roberta
-                                    attention_mask=attention_mask,
-                                        past_key_values=past_key_values
-                            )
-            #######################################################################
-            else:
-                raise NotImplementedError("Only T5 (prefix) and Roberta are supported.")
-            
+            outputs = self.encoder(inputs_embeds=enc_in, attention_mask=attention_mask,)
+
+
         enc_out = outputs.last_hidden_state
 
         enc_out = enc_out.reshape((-1, n_channels, n_patches, self.config.d_model))
@@ -404,7 +478,7 @@ class MOMENT(nn.Module):
         # dec_out = self.head(enc_out)  # [batch_size x n_channels x seq_len]
         dec_out = self.recon_head(enc_out)  # [batch_size x n_channels x seq_len]
         #######################################################################
-        
+
         dec_out = self.normalizer(x=dec_out, mode="denorm")
 
         if self.config.getattr("debug", False):
@@ -521,7 +595,7 @@ class MOMENT(nn.Module):
     #         metadata={"anomaly_criterion": anomaly_criterion},
     #     )
     # endregion
-    
+
     def forecast(
         self, x_enc: torch.Tensor, input_mask: torch.Tensor = None, **kwargs
     ) -> TimeseriesOutputs:
@@ -674,6 +748,7 @@ class MOMENT(nn.Module):
         x_enc: torch.Tensor,
         mask: torch.Tensor = None,
         input_mask: torch.Tensor = None,
+        task_name: str = None,
         **kwargs,
     ) -> TimeseriesOutputs:
         if input_mask is None:
