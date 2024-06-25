@@ -124,7 +124,6 @@ class MPT(nn.Module):
 
 
 
-
 class PretrainHead(nn.Module):
     def __init__(
         self,
@@ -146,31 +145,6 @@ class PretrainHead(nn.Module):
         x = x.flatten(start_dim=2, end_dim=3)
         return x
 
-# region
-# class ClassificationHead(nn.Module):
-#     def __init__(
-#         self,
-#         n_channels: int = 1,
-#         d_model: int = 768,
-#         n_classes: int = 2,
-#         head_dropout: int = 0.1,
-#         reduction: str = "concat",
-#     ):
-#         super().__init__()
-#         self.dropout = nn.Dropout(head_dropout)
-#         if reduction == "mean":
-#             self.linear = nn.Linear(d_model, n_classes)
-#         elif reduction == "concat":
-#             self.linear = nn.Linear(n_channels * d_model, n_classes)
-#         else:
-#             raise ValueError(f"Reduction method {reduction} not implemented. Only 'mean' and 'concat' are supported.")
-
-#     def forward(self, x, input_mask: torch.Tensor = None):
-#         x = torch.mean(x, dim=1)
-#         x = self.dropout(x)
-#         y = self.linear(x)
-#         return y
-# endregion
 
 class ForecastingHead(nn.Module):
     def __init__(
@@ -216,7 +190,6 @@ class MOMENT(nn.Module):
         )
         self.mask_generator = Masking(mask_ratio=config.getattr("mask_ratio", 0.0))
         self.encoder = self._get_transformer_backbone(config)
-        # self.head = self._get_head(self.task_name)
         ###################################
         # multi-task prompt tuning
         if config.getattr("MPT", False):
@@ -225,7 +198,6 @@ class MOMENT(nn.Module):
                                                         n_tokens=config.getattr("num_prefix", 2),)
 
         self.recon_head = self._get_head(TASKS.RECONSTRUCTION)
-        # self.cls_head = self._get_head(TASKS.CLASSIFICATION)
         self.fore_head = self._get_head(TASKS.FORECASTING)
         self.emb_head = self._get_head(TASKS.EMBED)
         ###################################
@@ -287,14 +259,6 @@ class MOMENT(nn.Module):
                 self.config.getattr("dropout", 0.1),
                 self.config.getattr("orth_gain", 1.41),
             )
-        # elif task_name == TASKS.CLASSIFICATION:
-        #     return ClassificationHead(
-        #         self.config.n_channels,
-        #         self.config.d_model,
-        #         self.config.num_class,
-        #         self.config.getattr("dropout", 0.1),
-        #         reduction = self.config.getattr("reduction", "concat"),
-        #     )
         elif task_name == TASKS.FORECASTING:
             num_patches = (
                 max(self.config.seq_len, self.config.patch_len) - self.config.patch_len
@@ -475,7 +439,6 @@ class MOMENT(nn.Module):
         enc_out = enc_out.reshape((-1, n_channels, n_patches, self.config.d_model))
 
         #######################################################################
-        # dec_out = self.head(enc_out)  # [batch_size x n_channels x seq_len]
         dec_out = self.recon_head(enc_out)  # [batch_size x n_channels x seq_len]
         #######################################################################
 
@@ -516,86 +479,6 @@ class MOMENT(nn.Module):
         #######################################################################
         )
 
-    # region
-    # def reconstruct(
-    #     self,
-    #     x_enc: torch.Tensor,
-    #     input_mask: torch.Tensor = None,
-    #     mask: torch.Tensor = None,
-    #     **kwargs,
-    # ) -> TimeseriesOutputs:
-    #     if mask is None:
-    #         mask = torch.ones_like(input_mask)
-
-    #     batch_size, n_channels, _ = x_enc.shape
-    #     x_enc = self.normalizer(x=x_enc, mask=mask * input_mask, mode="norm")
-
-    #     x_enc = self.tokenizer(x=x_enc)
-
-    #     enc_in = self.patch_embedding(x_enc, mask=mask)
-
-    #     n_patches = enc_in.shape[2]
-    #     enc_in = enc_in.reshape(
-    #         (batch_size * n_channels, n_patches, self.config.d_model)
-    #     )
-    #     # [batch_size * n_channels x n_patches x d_model]
-
-    #     patch_view_mask = Masking.convert_seq_to_patch_view(input_mask, self.patch_len)
-    #     attention_mask = patch_view_mask.repeat_interleave(n_channels, dim=0).to(
-    #         x_enc.device
-    #     )
-
-    #     n_tokens = 0
-    #     if "prompt_embeds" in kwargs:
-    #         prompt_embeds = kwargs["prompt_embeds"].to(x_enc.device)
-
-    #         if isinstance(prompt_embeds, nn.Embedding):
-    #             prompt_embeds = prompt_embeds.weight.data.unsqueeze(0)
-
-    #         n_tokens = prompt_embeds.shape[1]
-
-    #         enc_in = self._cat_learned_embedding_to_input(prompt_embeds, enc_in)
-    #         attention_mask = self._extend_attention_mask(attention_mask, n_tokens)
-
-    #     if self.config.transformer_type == "encoder_decoder":
-    #         outputs = self.encoder(
-    #             inputs_embeds=enc_in,
-    #             decoder_inputs_embeds=enc_in,
-    #             attention_mask=attention_mask,
-    #         )
-    #     else:
-    #         outputs = self.encoder(inputs_embeds=enc_in, attention_mask=attention_mask)
-    #     enc_out = outputs.last_hidden_state
-    #     enc_out = enc_out[:, n_tokens:, :]
-
-    #     enc_out = enc_out.reshape((-1, n_channels, n_patches, self.config.d_model))
-    #     # [batch_size x n_channels x n_patches x d_model]
-
-    #     dec_out = self.head(enc_out)  # [batch_size x n_channels x seq_len]
-    #     dec_out = self.normalizer(x=dec_out, mode="denorm")
-
-    #     return TimeseriesOutputs(input_mask=input_mask, reconstruction=dec_out)
-
-    # def detect_anomalies(
-    #     self,
-    #     x_enc: torch.Tensor,
-    #     input_mask: torch.Tensor = None,
-    #     anomaly_criterion: str = "mse",
-    #     **kwargs,
-    # ) -> TimeseriesOutputs:
-    #     outputs = self.reconstruct(x_enc=x_enc, input_mask=input_mask)
-    #     self.anomaly_criterion = get_anomaly_criterion(anomaly_criterion)
-
-    #     anomaly_scores = self.anomaly_criterion(x_enc, outputs.reconstruction)
-
-    #     return TimeseriesOutputs(
-    #         input_mask=input_mask,
-    #         reconstruction=outputs.reconstruction,
-    #         anomaly_scores=anomaly_scores,
-    #         metadata={"anomaly_criterion": anomaly_criterion},
-    #     )
-    # endregion
-
     def forecast(
         self, x_enc: torch.Tensor, input_mask: torch.Tensor = None, **kwargs
     ) -> TimeseriesOutputs:
@@ -629,119 +512,12 @@ class MOMENT(nn.Module):
         # [batch_size x n_channels x n_patches x d_model]
 
         #######################################################################
-        # dec_out = self.head(enc_out)  # [batch_size x n_channels x forecast_horizon]
         dec_out = self.fore_head(enc_out)  # [batch_size x n_channels x forecast_horizon]
         #######################################################################
         dec_out = self.normalizer(x=dec_out, mode="denorm")
 
         return TimeseriesOutputs(input_mask=input_mask, forecast=dec_out)
 
-    # region
-    # def short_forecast(
-    #     self,
-    #     x_enc: torch.Tensor,
-    #     input_mask: torch.Tensor = None,
-    #     forecast_horizon: int = 1,
-    #     **kwargs,
-    # ) -> TimeseriesOutputs:
-    #     batch_size, n_channels, seq_len = x_enc.shape
-    #     num_masked_patches = ceil(forecast_horizon / self.patch_len)
-    #     num_masked_timesteps = num_masked_patches * self.patch_len
-
-    #     x_enc = self.normalizer(x=x_enc, mask=input_mask, mode="norm")
-    #     x_enc = torch.nan_to_num(x_enc, nan=0, posinf=0, neginf=0)
-
-    #     # Shift the time-series and mask the last few timesteps for forecasting
-    #     x_enc = torch.roll(x_enc, shifts=-num_masked_timesteps, dims=2)
-    #     input_mask = torch.roll(input_mask, shifts=-num_masked_timesteps, dims=1)
-
-    #     # Attending to mask tokens
-    #     input_mask[:, -num_masked_timesteps:] = 1
-    #     mask = torch.ones_like(input_mask)
-    #     mask[:, -num_masked_timesteps:] = 0
-
-    #     x_enc = self.tokenizer(x=x_enc)
-    #     enc_in = self.patch_embedding(x_enc, mask=mask)
-
-    #     n_patches = enc_in.shape[2]
-    #     enc_in = enc_in.reshape(
-    #         (batch_size * n_channels, n_patches, self.config.d_model)
-    #     )
-    #     # [batch_size * n_channels x n_patches x d_model]
-
-    #     patch_view_mask = Masking.convert_seq_to_patch_view(input_mask, self.patch_len)
-    #     attention_mask = patch_view_mask.repeat_interleave(n_channels, dim=0)
-    #     outputs = self.encoder(inputs_embeds=enc_in, attention_mask=attention_mask)
-    #     enc_out = outputs.last_hidden_state
-    #     enc_out = enc_out.reshape((-1, n_channels, n_patches, self.config.d_model))
-
-    #     dec_out = self.head(enc_out)  # [batch_size x n_channels x seq_len]
-
-    #     end = -num_masked_timesteps + forecast_horizon
-    #     end = None if end == 0 else end
-
-    #     dec_out = self.normalizer(x=dec_out, mode="denorm")
-    #     forecast = dec_out[:, :, -num_masked_timesteps:end]
-
-    #     return TimeseriesOutputs(
-    #         input_mask=input_mask,
-    #         reconstruction=dec_out,
-    #         forecast=forecast,
-    #         metadata={"forecast_horizon": forecast_horizon},
-    #     )
-
-    # def classify(
-    #     self,
-    #     x_enc: torch.Tensor,
-    #     input_mask: torch.Tensor = None,
-    #     reduction: str = "concat",
-    #     **kwargs,
-    # ) -> TimeseriesOutputs:
-    #     batch_size, n_channels, seq_len = x_enc.shape
-
-    #     if input_mask is None:
-    #         input_mask = torch.ones((batch_size, seq_len)).to(x_enc.device)
-
-    #     x_enc = self.normalizer(x=x_enc, mask=input_mask, mode="norm")
-    #     x_enc = torch.nan_to_num(x_enc, nan=0, posinf=0, neginf=0)
-
-    #     input_mask_patch_view = Masking.convert_seq_to_patch_view(
-    #         input_mask, self.patch_len
-    #     )
-
-    #     x_enc = self.tokenizer(x=x_enc)
-    #     enc_in = self.patch_embedding(x_enc, mask=input_mask)
-
-    #     n_patches = enc_in.shape[2]
-    #     enc_in = enc_in.reshape(
-    #         (batch_size * n_channels, n_patches, self.config.d_model)
-    #     )
-
-    #     patch_view_mask = Masking.convert_seq_to_patch_view(input_mask, self.patch_len)
-    #     attention_mask = patch_view_mask.repeat_interleave(n_channels, dim=0)
-    #     outputs = self.encoder(inputs_embeds=enc_in, attention_mask=attention_mask)
-    #     enc_out = outputs.last_hidden_state
-
-    #     enc_out = enc_out.reshape((-1, n_channels, n_patches, self.config.d_model))
-    #     # [batch_size x n_channels x n_patches x d_model]
-
-    #     # Mean across channels
-    #     if reduction == "mean":
-    #         # [batch_size x n_patches x d_model]
-    #         enc_out = enc_out.mean(dim=1, keepdim=False)
-    #     # Concatenate across channels
-    #     elif reduction == "concat":
-    #         # [batch_size x n_patches x d_model * n_channels]
-    #         enc_out = enc_out.permute(0, 2, 3, 1).reshape(
-    #             batch_size, n_patches, self.config.d_model * n_channels)
-
-    #     else:
-    #         raise NotImplementedError(f"Reduction method {reduction} not implemented.")
-
-    #     logits = self.head(enc_out, input_mask=input_mask)
-
-    #     return TimeseriesOutputs(embeddings=enc_out, logits=logits, metadata=reduction)
-    # endregion
 
     def forward(
         self,
@@ -762,8 +538,6 @@ class MOMENT(nn.Module):
             return self.embed(x_enc=x_enc, input_mask=input_mask, **kwargs)
         elif self.task_name == TASKS.FORECASTING:
             return self.forecast(x_enc=x_enc, input_mask=input_mask, **kwargs)
-        # elif self.task_name == TASKS.CLASSIFICATION:
-        #     return self.classify(x_enc=x_enc, input_mask=input_mask, **kwargs)
         else:
             raise NotImplementedError(f"Task {self.task_name} not implemented.")
 
@@ -787,12 +561,6 @@ class MOMENTPipeline(MOMENT, PyTorchModelHubMixin):
                 raise ValueError(
                     "forecast_horizon must be specified for long-horizon forecasting."
                 )
-
-        # if config.task_name == TASKS.CLASSIFICATION:
-        #     if not hasattr(config, "n_channels"):
-        #         raise ValueError("n_channels must be specified for classification.")
-        #     if not hasattr(config, "num_class"):
-        #         raise ValueError("num_class must be specified for classification.")
 
     def init(self) -> None:
         if self.new_task_name != TASKS.RECONSTRUCTION:
