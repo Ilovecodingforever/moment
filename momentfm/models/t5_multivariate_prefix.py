@@ -51,16 +51,8 @@ class T5AttentionWithPrefix(T5Attention):
         super().__init__(config, has_relative_attention_bias=has_relative_attention_bias)
         self.num_prefix = config.num_prefix
 
-        # shared prompt: 1 x (num_heads x num_prefix x d_kv)
-        # hidden_states: bsz x seq_len x dim: 7*64*64
-        # just learn 1D output, reshape to 1 x (num_heads x num_prefix x d_kv)
-        self.shared_prompt_projection = nn.Sequential(
-                                                nn.Flatten(start_dim=0),
-                                                nn.Linear(7*64*config.d_model, config.reparam_dim),
-                                                nn.Tanh(),
-                                                nn.Linear(config.reparam_dim, config.num_heads * config.num_prefix * config.d_kv),
-                                                nn.Unflatten(0, (1, config.num_heads, config.num_prefix, config.d_kv))
-                                              )
+        self.config = config
+
     # fmt: off
 
     def forward(
@@ -127,13 +119,7 @@ class T5AttentionWithPrefix(T5Attention):
         # shared prompt: 1 x (num_heads x num_prefix x d_kv)
         shared_prompt_projection_key = self.shared_prompt_projection(hidden_states).repeat(batch_size, 1, 1, 1)
         shared_prompt_projection_value = self.shared_prompt_projection(hidden_states).repeat(batch_size, 1, 1, 1)
-
-        # TODO: remove this line
-        shared_prompt_projection_key = torch.zeros_like(shared_prompt_projection_key)
-        shared_prompt_projection_value = torch.zeros_like(shared_prompt_projection_value)
         ################################################
-
-
 
         # get query states
         query_states = shape(self.q(hidden_states))  # (batch_size, n_heads, seq_length, dim_per_head)
@@ -151,8 +137,15 @@ class T5AttentionWithPrefix(T5Attention):
         present_key_value_state = (key_states, value_states) if (self.is_decoder and use_cache) else None
 
         # prefix tuning
-        key_states = torch.cat([self.prefix_key, shared_prompt_projection_key, key_states], dim=2)     # self.prefix_key: bsz, num_heads, num_prefix, d_kv
-        value_states = torch.cat([self.prefix_value, shared_prompt_projection_value, value_states], dim=2)
+
+        if self.config.prefix_tuning:
+            key_states = torch.cat([self.prefix_key, shared_prompt_projection_key, key_states], dim=2)     # self.prefix_key: bsz, num_heads, num_prefix, d_kv
+            value_states = torch.cat([self.prefix_value, shared_prompt_projection_value, value_states], dim=2)
+        else:
+            key_states = torch.cat([shared_prompt_projection_key, key_states], dim=2)     # self.prefix_key: bsz, num_heads, num_prefix, d_kv
+            value_states = torch.cat([shared_prompt_projection_value, value_states], dim=2)
+
+
 
         # key_states = torch.cat([self.prefix_key, key_states], dim=2)     # self.prefix_key: bsz, num_heads, num_prefix, d_kv
         # value_states = torch.cat([self.prefix_value, value_states], dim=2)
@@ -160,7 +153,7 @@ class T5AttentionWithPrefix(T5Attention):
 
         if mask is not None:
             prefix_mask = torch.zeros(
-                batch_size, 1, mask.size(2), self.num_prefix*2, device=hidden_states.device
+                batch_size, 1, mask.size(2), self.num_prefix*(2 if self.config.prefix_tuning else 1), device=hidden_states.device
                 # batch_size, 1, mask.size(2), self.num_prefix, device=hidden_states.device
             )
             mask = torch.cat([prefix_mask, mask], dim=-1)
@@ -190,7 +183,7 @@ class T5AttentionWithPrefix(T5Attention):
             position_bias = torch.cat(
                 [
                     torch.zeros(
-                        position_bias.shape[:3] + (self.num_prefix*2,),
+                        position_bias.shape[:3] + (self.num_prefix*(2 if self.config.prefix_tuning else 1),),
                         # position_bias.shape[:3] + (self.num_prefix,),
                         device=position_bias.device,
                     ),
@@ -261,18 +254,10 @@ class T5StackWithPrefixMulti(T5Stack):
         self.input_tokens = torch.arange(self.config.num_prefix)
         per_layer_dim = self.config.num_heads * self.config.d_kv
         total_dim = self.config.num_layers * 2 * per_layer_dim
-        self.prefix_embed = (
-            nn.Sequential(
-                nn.Embedding(self.config.num_prefix, per_layer_dim),
-                nn.Linear(per_layer_dim, self.config.reparam_dim),
-                nn.Tanh(),
-                nn.Linear(self.config.reparam_dim, total_dim),
-            )
-            if self.config.reparam
-            else nn.Embedding(self.config.num_prefix, total_dim)
-        )
-        if self.is_decoder:
-            self.prefix_embed_cross = (
+
+
+        if self.config.prefix_tuning:
+            self.prefix_embed = (
                 nn.Sequential(
                     nn.Embedding(self.config.num_prefix, per_layer_dim),
                     nn.Linear(per_layer_dim, self.config.reparam_dim),
@@ -282,6 +267,18 @@ class T5StackWithPrefixMulti(T5Stack):
                 if self.config.reparam
                 else nn.Embedding(self.config.num_prefix, total_dim)
             )
+            if self.is_decoder:
+                self.prefix_embed_cross = (
+                    nn.Sequential(
+                        nn.Embedding(self.config.num_prefix, per_layer_dim),
+                        nn.Linear(per_layer_dim, self.config.reparam_dim),
+                        nn.Tanh(),
+                        nn.Linear(self.config.reparam_dim, total_dim),
+                    )
+                    if self.config.reparam
+                    else nn.Embedding(self.config.num_prefix, total_dim)
+                )
+
 
         self.block = torch.nn.ModuleList(
             [
@@ -292,6 +289,22 @@ class T5StackWithPrefixMulti(T5Stack):
 
         # T5Stack has a self.init_weights() call here, but it's repetitive since we do it in
         # T5ForConditionalGenerationWithPrefix anyway.
+
+
+        # shared prompt: 1 x (num_heads x num_prefix x d_kv)
+        # hidden_states: bsz x seq_len x dim: 7*64*64
+        # just learn 1D output, reshape to 1 x (num_heads x num_prefix x d_kv)
+        self.shared_prompt_projection = nn.Sequential(
+                                                nn.Flatten(start_dim=0),
+                                                nn.Linear(7 * \
+                                                    (config.num_patches + (config.num_prefix if config.MPT else 0)) * \
+                                                        config.d_model, config.reparam_dim),
+                                                nn.Tanh(),
+                                                nn.Linear(config.reparam_dim, config.num_heads * config.num_prefix * config.d_kv),
+                                                nn.Unflatten(0, (1, config.num_heads, config.num_prefix, config.d_kv))
+                                              )
+
+
 
     def generate_prefix_item(self, input_ids, embedding):
         bsz = input_ids.size(0)
@@ -313,25 +326,37 @@ class T5StackWithPrefixMulti(T5Stack):
         # prefix_key, prefix_value = self.generate_prefix_item(input_ids, self.prefix_embed)
 
     def forward(self, input_ids=None, inputs_embeds=None, **kwargs):
-        prefix_key, prefix_value = self.generate_prefix_item(inputs_embeds, self.prefix_embed)
-        kwargs['use_cache'] = False
-    ################################################
-        prefix_key_cross = prefix_value_cross = [None] * len(prefix_key)
-        if self.is_decoder:
-            prefix_key_cross, prefix_value_cross = self.generate_prefix_item(
-                input_ids, self.prefix_embed_cross
-            )
-        for block, k, v, k_cross, v_cross in zip(
-            self.block, prefix_key, prefix_value, prefix_key_cross, prefix_value_cross
-        ):
+        # is this a reference or copy? 
+        # should be a reference. weigths are updated. Also id(self.shared_prompt_projection) are the same
+        # why do both self and cross attention?
+        # self attention is for encoder, cross is for decoder (not used)
+        for block in self.block:
             for layer in block.layer:
                 if isinstance(layer, T5LayerSelfAttentionWithPrefix):
-                    layer.SelfAttention.prefix_key = k
-                    layer.SelfAttention.prefix_value = v
+                    layer.SelfAttention.shared_prompt_projection = self.shared_prompt_projection
                 if isinstance(layer, T5LayerCrossAttentionWithPrefix):
-                    layer.EncDecAttention.prefix_key = k_cross
-                    layer.EncDecAttention.prefix_value = v_cross
+                    layer.EncDecAttention.shared_prompt_projection = self.shared_prompt_projection
 
+        if self.config.prefix_tuning:
+
+            prefix_key, prefix_value = self.generate_prefix_item(inputs_embeds, self.prefix_embed)
+            kwargs['use_cache'] = False
+        ################################################
+            prefix_key_cross = prefix_value_cross = [None] * len(prefix_key)
+            if self.is_decoder:
+                prefix_key_cross, prefix_value_cross = self.generate_prefix_item(
+                    input_ids, self.prefix_embed_cross
+                )
+            for block, k, v, k_cross, v_cross in zip(
+                self.block, prefix_key, prefix_value, prefix_key_cross, prefix_value_cross
+            ):
+                for layer in block.layer:
+                    if isinstance(layer, T5LayerSelfAttentionWithPrefix):
+                        layer.SelfAttention.prefix_key = k
+                        layer.SelfAttention.prefix_value = v
+                    if isinstance(layer, T5LayerCrossAttentionWithPrefix):
+                        layer.EncDecAttention.prefix_key = k_cross
+                        layer.EncDecAttention.prefix_value = v_cross
 
 
         output = super().forward(input_ids=input_ids, inputs_embeds=inputs_embeds, **kwargs)
@@ -342,14 +367,15 @@ class T5StackWithPrefixMulti(T5Stack):
 
     def clean_up(self):
         # For safety, in case other code uses it
-        for block in self.block:
-            for layer in block.layer:
-                if isinstance(layer, T5LayerSelfAttentionWithPrefix):
-                    del layer.SelfAttention.prefix_key
-                    del layer.SelfAttention.prefix_value
-                if isinstance(layer, T5LayerCrossAttentionWithPrefix):
-                    del layer.EncDecAttention.prefix_key
-                    del layer.EncDecAttention.prefix_value
+        if self.config.prefix_tuning:
+            for block in self.block:
+                for layer in block.layer:
+                    if isinstance(layer, T5LayerSelfAttentionWithPrefix):
+                        del layer.SelfAttention.prefix_key
+                        del layer.SelfAttention.prefix_value
+                    if isinstance(layer, T5LayerCrossAttentionWithPrefix):
+                        del layer.EncDecAttention.prefix_key
+                        del layer.EncDecAttention.prefix_value
 
 
 class T5ForConditionalGenerationWithPrefixMulti(T5ForConditionalGeneration):
