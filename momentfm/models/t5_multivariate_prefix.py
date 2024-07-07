@@ -128,6 +128,7 @@ class T5AttentionWithPrefix(T5Attention):
             # make it batch x channel x time x d_model
             # sample to 16 time steps
                 # TODO: change sample to smoothing?
+                # TODO: ignore possible padding
             # transpose to (batch*time) x channel x d_model
             # do multihead attention
             # average across channels, and reshape, so output is batch x (time*d_model)
@@ -442,7 +443,7 @@ class T5StackWithPrefixMulti(T5Stack):
     # def forward(self, input_ids=None, **kwargs):
         # prefix_key, prefix_value = self.generate_prefix_item(input_ids, self.prefix_embed)
 
-    def forward(self, n_channels, input_ids=None, inputs_embeds=None, **kwargs):
+    def forward(self, n_channels=None, input_ids=None, inputs_embeds=None, **kwargs):
         # is this a reference or copy?
         # should be a reference. weigths are updated. Also id(self.shared_prompt_projection) are the same
         # why do both self and cross attention?

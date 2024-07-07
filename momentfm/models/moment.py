@@ -347,6 +347,9 @@ class MOMENT(nn.Module):
         reduction: str = "mean",
         **kwargs,
     ) -> TimeseriesOutputs:
+
+        raise NotImplementedError("Embedding task not implemented.")
+
         batch_size, n_channels, seq_len = x_enc.shape
 
         if input_mask is None:
@@ -449,7 +452,10 @@ class MOMENT(nn.Module):
             # )
             raise NotImplementedError("Encoder-decoder not implemented for prefix T5.")
         else:
-            outputs = self.encoder(inputs_embeds=enc_in, attention_mask=attention_mask, n_channels=n_channels)
+            if isinstance(self.patch_embedding.value_embedding, MPT):
+                outputs = self.encoder(n_channels=n_channels, inputs_embeds=enc_in, attention_mask=attention_mask)
+            else:
+                outputs = self.encoder(inputs_embeds=enc_in, attention_mask=attention_mask)
 
 
         enc_out = outputs.last_hidden_state
@@ -530,7 +536,13 @@ class MOMENT(nn.Module):
 
         patch_view_mask = Masking.convert_seq_to_patch_view(input_mask, self.patch_len)
         attention_mask = patch_view_mask.repeat_interleave(n_channels, dim=0)
-        outputs = self.encoder(n_channels, inputs_embeds=enc_in, attention_mask=attention_mask)
+        
+        if isinstance(self.patch_embedding.value_embedding, MPT):
+            outputs = self.encoder(n_channels=n_channels, inputs_embeds=enc_in, attention_mask=attention_mask)
+        else:
+            outputs = self.encoder(inputs_embeds=enc_in, attention_mask=attention_mask)        
+        
+        # outputs = self.encoder(n_channels=n_channels, inputs_embeds=enc_in, attention_mask=attention_mask)
         enc_out = outputs.last_hidden_state
         enc_out = enc_out.reshape((-1, n_channels, n_patches, self.config.d_model))
         # [batch_size x n_channels x n_patches x d_model]
