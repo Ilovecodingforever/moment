@@ -117,8 +117,50 @@ class T5AttentionWithPrefix(T5Attention):
 
         ################################################
         # shared prompt: 1 x (num_heads x num_prefix x d_kv)
-        shared_prompt_projection_key = self.shared_prompt_projection(hidden_states).repeat(batch_size, 1, 1, 1)
-        shared_prompt_projection_value = self.shared_prompt_projection(hidden_states).repeat(batch_size, 1, 1, 1)
+
+        # TODO: ignore MPT when doing deep prompt?
+        if self.config.multivariate_projection == 'attention':
+            # TODO: can average across channel dimension in the end?
+            # https://stackoverflow.com/questions/62705268/why-bert-transformer-uses-cls-token-for-classification-instead-of-average-over
+
+            # the plan:
+            # original input: (batch*channel) x time x d_model
+            # make it batch x channel x time x d_model
+            # sample to 16 time steps
+                # TODO: change sample to smoothing?
+            # transpose to (batch*time) x channel x d_model
+            # do multihead attention
+            # average across channels, and reshape, so output is batch x (time*d_model)
+            # linear, unflatten to batch x 1 x num_heads x num_prefix x d_kv
+            # repeat and unflatten, so output is (batch*channel) x n_heads x num_prefix x d_kv
+
+            sample = 16
+            n_channels = self.n_channels
+            _, seq_length, d_model = hidden_states.shape
+            batch_size_real = batch_size // n_channels
+
+            # key
+            # TODO: is reshape invertible?
+            hidden_states_ = hidden_states.reshape(-1, n_channels, seq_length, d_model)
+            hidden_states_proj = hidden_states_[:, :, ::seq_length//sample, :].transpose(1, 2).reshape(-1, n_channels, d_model)
+            attn_output, attn_output_weights = self.shared_prompt_projection['mha'](self.shared_prompt_projection['q'](hidden_states_proj),
+                                                                                    self.shared_prompt_projection['k'](hidden_states_proj),
+                                                                                    self.shared_prompt_projection['v'](hidden_states_proj))
+            attn_output = attn_output.mean(dim=1).reshape(batch_size_real, sample, -1).flatten(1)
+            shared_prompt_projection_key = self.shared_prompt_projection['unflatten'](self.shared_prompt_projection['linear'](attn_output)).repeat(1, n_channels, 1, 1, 1).flatten(0, 1)
+
+            # value
+            hidden_states_ = hidden_states.reshape(-1, n_channels, seq_length, d_model)
+            hidden_states_proj = hidden_states_[:, :, ::seq_length//sample, :].transpose(1, 2).reshape(-1, n_channels, d_model)
+            attn_output, attn_output_weights = self.shared_prompt_projection['mha'](self.shared_prompt_projection['q'](hidden_states_proj),
+                                                                                    self.shared_prompt_projection['k'](hidden_states_proj),
+                                                                                    self.shared_prompt_projection['v'](hidden_states_proj))
+            attn_output = attn_output.mean(dim=1).reshape(batch_size_real, sample, -1).flatten(1)
+            shared_prompt_projection_value = self.shared_prompt_projection['unflatten'](self.shared_prompt_projection['linear'](attn_output)).repeat(1, n_channels, 1, 1, 1).flatten(0, 1)
+
+        else:     # TODO: fix this
+            shared_prompt_projection_key = self.shared_prompt_projection(hidden_states).repeat(batch_size, 1, 1, 1)
+            shared_prompt_projection_value = self.shared_prompt_projection(hidden_states).repeat(batch_size, 1, 1, 1)
         ################################################
 
         # get query states
@@ -294,16 +336,91 @@ class T5StackWithPrefixMulti(T5Stack):
         # shared prompt: 1 x (num_heads x num_prefix x d_kv)
         # hidden_states: bsz x seq_len x dim: 7*64*64
         # just learn 1D output, reshape to 1 x (num_heads x num_prefix x d_kv)
-        self.shared_prompt_projection = nn.Sequential(
-                                                nn.Flatten(start_dim=0),
-                                                nn.Linear(7 * \
-                                                    (config.num_patches + (config.num_prefix if config.MPT else 0)) * \
-                                                        config.d_model, config.reparam_dim),
-                                                nn.Tanh(),
-                                                nn.Linear(config.reparam_dim, config.num_heads * config.num_prefix * config.d_kv),
-                                                nn.Unflatten(0, (1, config.num_heads, config.num_prefix, config.d_kv))
-                                              )
 
+        if config.multivariate_projection == 'linear':
+            self.shared_prompt_projection = nn.Sequential(
+                                                    nn.Flatten(start_dim=0),
+                                                    nn.Linear(7 * \
+                                                        (config.num_patches + (config.num_prefix if config.MPT else 0)) * \
+                                                            config.d_model, config.reparam_dim),
+                                                    nn.Tanh(),
+                                                    nn.Linear(config.reparam_dim, config.num_heads * config.num_prefix * config.d_kv),
+                                                    nn.Unflatten(0, (1, config.num_heads, config.num_prefix, config.d_kv))
+                                                )
+
+        # elif config.multivariate_projection == 'conv':
+        #     # input: torch.Size([7, 80, 1024])
+
+        #     # TODO: not variable number of channels
+
+        #     # sample to 16 time steps, or no sample
+        #     # do 1d conv
+        #     # channel: time, length: variable
+        #     self.shared_prompt_projection = nn.Sequential(
+        #         Sample(),
+        #         nn.Linear(config.d_model, 1),
+        #         nn.Flatten(start_dim=1),
+        #         Transpose(),
+        #         nn.Conv1d(in_channels=16, out_channels=1, kernel_size=3),
+
+        #     )
+
+
+        elif config.multivariate_projection == 'attention':
+            # TODO: can average across channel dimension in the end?
+            # https://stackoverflow.com/questions/62705268/why-bert-transformer-uses-cls-token-for-classification-instead-of-average-over
+
+
+            # the plan:
+            # original input: channel x time x d_model
+            # sample to 16 time steps
+            #           -- so no dependence on sequence length
+            # transpose to time x channel x d_model
+            # do multihead attention
+            # average across channels, so output is 1 x (time x 1 x d_model)
+            # flatten, linear, unflatten
+            dim, sample = 64, 16
+            self.shared_prompt_projection_k = nn.Linear(config.d_model, dim, bias=False)
+            self.shared_prompt_projection_q = nn.Linear(config.d_model, dim, bias=False)
+            self.shared_prompt_projection_v = nn.Linear(config.d_model, dim, bias=False)
+            # batch size: time, length: variable, E: 1024
+            self.shared_prompt_projection_mha = nn.MultiheadAttention(dim, num_heads=1, batch_first=True)
+            self.shared_prompt_projection_linear = nn.Linear(sample*dim, config.num_heads * config.num_prefix * config.d_kv)
+            self.unflatten = nn.Unflatten(1, (1, config.num_heads, config.num_prefix, config.d_kv))
+
+            self.shared_prompt_projection = {
+                'k': self.shared_prompt_projection_k,
+                'q': self.shared_prompt_projection_q,
+                'v': self.shared_prompt_projection_v,
+                'mha': self.shared_prompt_projection_mha,
+                'linear': self.shared_prompt_projection_linear,
+                'unflatten': self.unflatten
+            }
+
+
+
+            # self.shared_prompt_projection = nn.Sequential(
+            #                                         Sample(),
+            #                                         # nn.Linear(config.d_model, 1),
+            #                                         # nn.Flatten(start_dim=1),
+            #                                         nn.MultiheadAttention(16, num_heads=1, batch_first=False),  # batch size: time, length: variable, E: 1024
+            #                                         # TODO: tanh? relu?
+
+            #                                         nn.Linear(16*7, 1),
+            #                                         # TODO: sequence length is not even variable
+            # )
+
+        else:
+            raise ValueError('Invalid projection type')
+
+
+    class Transpose(torch.nn.Module):
+        def forward(self, x):
+            return x.T
+
+    class Sample(torch.nn.Module):
+        def forward(self, x):
+            return x[:, ::(len(x)//16)]
 
 
     def generate_prefix_item(self, input_ids, embedding):
@@ -325,8 +442,8 @@ class T5StackWithPrefixMulti(T5Stack):
     # def forward(self, input_ids=None, **kwargs):
         # prefix_key, prefix_value = self.generate_prefix_item(input_ids, self.prefix_embed)
 
-    def forward(self, input_ids=None, inputs_embeds=None, **kwargs):
-        # is this a reference or copy? 
+    def forward(self, n_channels, input_ids=None, inputs_embeds=None, **kwargs):
+        # is this a reference or copy?
         # should be a reference. weigths are updated. Also id(self.shared_prompt_projection) are the same
         # why do both self and cross attention?
         # self attention is for encoder, cross is for decoder (not used)
@@ -334,8 +451,10 @@ class T5StackWithPrefixMulti(T5Stack):
             for layer in block.layer:
                 if isinstance(layer, T5LayerSelfAttentionWithPrefix):
                     layer.SelfAttention.shared_prompt_projection = self.shared_prompt_projection
+                    layer.SelfAttention.n_channels = n_channels
                 if isinstance(layer, T5LayerCrossAttentionWithPrefix):
                     layer.EncDecAttention.shared_prompt_projection = self.shared_prompt_projection
+                    layer.EncDecAttention.n_channels = n_channels
 
         if self.config.prefix_tuning:
 
