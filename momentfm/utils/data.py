@@ -40,7 +40,7 @@ def load_from_tsfile(
     IOError if the load fails.
     """
     # Check file ends in .ts, if not, insert
-    if not full_file_path_and_name.endswith(".ts"):
+    if not full_file_path_and_name.endswith(".ts") and not full_file_path_and_name.endswith(".tsf"):
         full_file_path_and_name = full_file_path_and_name + ".ts"
     # Open file
     with open(full_file_path_and_name, "r", encoding="utf-8") as file:
@@ -182,20 +182,26 @@ def _load_data(file, meta_data, replace_missing_vals_with="NaN"):
         else:
             current_length = len(channels[0].split(","))
         np_case = np.zeros(shape=(n_channels, current_length))
-        for i in range(0, n_channels):
-            single_channel = channels[i].strip()
-            data_series = single_channel.split(",")
-            data_series = [float(x) for x in data_series]
-            if len(data_series) != current_length:
-                raise IOError(
-                    f"Unequal length series, in case {n_cases} meta "
-                    f"data specifies all equal {series_length} but saw "
-                    f"{len(single_channel)}"
-                )
-            np_case[i] = np.array(data_series)
-        data.append(np_case)
-        if meta_data["classlabel"] or meta_data["targetlabel"]:
-            y_values.append(channels[n_channels])
+        try:
+            for i in range(0, n_channels):
+                single_channel = channels[i].strip()
+                data_series = single_channel.split(",")
+                data_series = [float(x) for x in data_series]
+                if len(data_series) != current_length:
+                    raise IOError(
+                        f"Unequal length series, in case {n_cases} meta "
+                        f"data specifies all equal {series_length} but saw "
+                        f"{len(single_channel)}"
+                    )
+                np_case[i] = np.array(data_series)
+            data.append(np_case)
+            if meta_data["classlabel"] or meta_data["targetlabel"]:
+                y_values.append(channels[n_channels])
+                
+        except IOError as e:
+            print(e)
+        
+        
     if meta_data["equallength"]:
         data = np.array(data)
     return data, np.asarray(y_values), meta_data

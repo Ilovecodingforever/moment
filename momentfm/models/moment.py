@@ -452,7 +452,8 @@ class MOMENT(nn.Module):
             # )
             raise NotImplementedError("Encoder-decoder not implemented for prefix T5.")
         else:
-            if isinstance(self.patch_embedding.value_embedding, MPT):
+            # if isinstance(self.patch_embedding.value_embedding, MPT):
+            if isinstance(self.encoder, T5StackWithPrefixMulti):
                 outputs = self.encoder(n_channels=n_channels, inputs_embeds=enc_in, attention_mask=attention_mask)
             else:
                 outputs = self.encoder(inputs_embeds=enc_in, attention_mask=attention_mask)
@@ -537,7 +538,8 @@ class MOMENT(nn.Module):
         patch_view_mask = Masking.convert_seq_to_patch_view(input_mask, self.patch_len)
         attention_mask = patch_view_mask.repeat_interleave(n_channels, dim=0)
         
-        if isinstance(self.patch_embedding.value_embedding, MPT):
+        # if isinstance(self.patch_embedding.value_embedding, MPT):
+        if isinstance(self.encoder, T5StackWithPrefixMulti):
             outputs = self.encoder(n_channels=n_channels, inputs_embeds=enc_in, attention_mask=attention_mask)
         else:
             outputs = self.encoder(inputs_embeds=enc_in, attention_mask=attention_mask)        
