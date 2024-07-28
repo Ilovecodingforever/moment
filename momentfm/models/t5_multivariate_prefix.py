@@ -118,6 +118,11 @@ class T5AttentionWithPrefix(T5Attention):
         ################################################
         # shared prompt: 1 x (num_heads x num_prefix x d_kv)
 
+        sample = 16
+        n_channels = self.n_channels
+        _, seq_length, d_model = hidden_states.shape
+        batch_size_real = batch_size // n_channels
+
         # TODO: ignore MPT when doing deep prompt?
         if self.config.multivariate_projection == 'attention':
             # TODO: can average across channel dimension in the end?
@@ -134,11 +139,6 @@ class T5AttentionWithPrefix(T5Attention):
             # average across channels, and reshape, so output is batch x (time*d_model)
             # linear, unflatten to batch x 1 x num_heads x num_prefix x d_kv
             # repeat and unflatten, so output is (batch*channel) x n_heads x num_prefix x d_kv
-
-            sample = 16
-            n_channels = self.n_channels
-            _, seq_length, d_model = hidden_states.shape
-            batch_size_real = batch_size // n_channels
 
             # key
             # TODO: is reshape invertible?
@@ -159,9 +159,14 @@ class T5AttentionWithPrefix(T5Attention):
             attn_output = attn_output.mean(dim=1).reshape(batch_size_real, sample, -1).flatten(1)
             shared_prompt_projection_value = self.shared_prompt_projection['unflatten'](self.shared_prompt_projection['linear'](attn_output)).repeat(1, n_channels, 1, 1, 1).flatten(0, 1)
 
-        else:     # TODO: fix this
-            shared_prompt_projection_key = self.shared_prompt_projection(hidden_states).repeat(batch_size, 1, 1, 1)
-            shared_prompt_projection_value = self.shared_prompt_projection(hidden_states).repeat(batch_size, 1, 1, 1)
+        elif self.config.multivariate_projection == 'linear':
+            hidden_states_ = hidden_states.reshape(-1, n_channels, seq_length, d_model)
+            hidden_states_proj = hidden_states_[:, :, ::seq_length//sample, :].reshape(-1, n_channels, sample*d_model)
+            shared_prompt_projection_key = self.shared_prompt_projection['unflatten'](torch.mean(self.shared_prompt_projection['linear'](hidden_states_proj), dim=1)).repeat(1, n_channels, 1, 1, 1).flatten(0, 1)
+            shared_prompt_projection_value = self.shared_prompt_projection['unflatten'](torch.mean(self.shared_prompt_projection['linear'](hidden_states_proj), dim=1)).repeat(1, n_channels, 1, 1, 1).flatten(0, 1)
+
+        else:
+            raise ValueError('Invalid projection type')
         ################################################
 
         # get query states
@@ -339,15 +344,41 @@ class T5StackWithPrefixMulti(T5Stack):
         # just learn 1D output, reshape to 1 x (num_heads x num_prefix x d_kv)
 
         if config.multivariate_projection == 'linear':
-            self.shared_prompt_projection = nn.Sequential(
-                                                    nn.Flatten(start_dim=0),
-                                                    nn.Linear(7 * \
-                                                        (config.num_patches + (config.num_prefix if config.MPT else 0)) * \
-                                                            config.d_model, config.reparam_dim),
-                                                    nn.Tanh(),
-                                                    nn.Linear(config.reparam_dim, config.num_heads * config.num_prefix * config.d_kv),
-                                                    nn.Unflatten(0, (1, config.num_heads, config.num_prefix, config.d_kv))
-                                                )
+            # self.shared_prompt_projection = nn.Sequential(
+            #                                         nn.Flatten(start_dim=0),
+            #                                         nn.Linear(7 * \
+            #                                             (config.num_patches + (config.num_prefix if config.MPT else 0)) * \
+            #                                                 config.d_model, config.reparam_dim),
+            #                                         nn.Tanh(),
+            #                                         nn.Linear(config.reparam_dim, config.num_heads * config.num_prefix * config.d_kv),
+            #                                         nn.Unflatten(0, (1, config.num_heads, config.num_prefix, config.d_kv))
+            #                                     )
+
+            # the plan:
+            # original input: channel x time x d_model
+            # sample to 16 time steps
+            #           -- so no dependence on sequence length
+            #   so channel x 16 x d_model
+            #  flatten: channel x 16*d_model
+
+
+            # transpose to time x channel x d_model
+            # do multihead attention
+            # average across channels, so output is 1 x (time x 1 x d_model)
+            # flatten, linear, unflatten
+
+            dim, sample = config.d_model, 16
+
+            self.shared_prompt_projection_linear = nn.Linear(sample*dim, config.num_heads * config.num_prefix * config.d_kv)
+            self.unflatten = nn.Unflatten(1, (1, config.num_heads, config.num_prefix, config.d_kv))
+
+            self.shared_prompt_projection = {
+                'linear': self.shared_prompt_projection_linear,
+                'unflatten': self.unflatten
+            }
+
+
+
 
         # elif config.multivariate_projection == 'conv':
         #     # input: torch.Size([7, 80, 1024])

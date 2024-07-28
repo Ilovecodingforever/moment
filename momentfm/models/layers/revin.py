@@ -11,6 +11,12 @@ def nanvar(tensor, dim=None, keepdim=False):
 def nanstd(tensor, dim=None, keepdim=False):
     output = nanvar(tensor, dim=dim, keepdim=keepdim)
     output = output.sqrt()
+    
+    # if output.isnan().any():
+    #     output = torch.zeros_like(output)
+    # if (output == 0).any():
+    #     output = torch.ones_like
+    
     return output
 
 

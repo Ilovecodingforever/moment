@@ -194,9 +194,12 @@ class MOMENT(nn.Module):
 
 
         # this name must be head in order to load pretrained weights
-        self.head = self._get_head(TASKS.RECONSTRUCTION)
-        self.fore_head = self._get_head(TASKS.FORECASTING)
-        self.emb_head = self._get_head(TASKS.EMBED)
+        self.head = self._get_head(TASKS.RECONSTRUCTION, None)
+        
+        for horizon in config.forecast_horizons:
+            setattr(self, f"fore_head_{horizon}", self._get_head(TASKS.FORECASTING, forecast_horizon=horizon))
+
+        self.emb_head = self._get_head(TASKS.EMBED, None)
         ###################################
 
         # Frozen parameters
@@ -248,7 +251,7 @@ class MOMENT(nn.Module):
             warnings.warn("Patch stride length is not equal to patch length.")
         return config
 
-    def _get_head(self, task_name: str) -> nn.Module:
+    def _get_head(self, task_name: str, forecast_horizon) -> nn.Module:
         if task_name == TASKS.RECONSTRUCTION:
             return PretrainHead(
                 self.config.d_model,
@@ -263,7 +266,7 @@ class MOMENT(nn.Module):
             self.head_nf = self.config.d_model * (num_patches + (self.config.num_prefix if self.config.getattr("MPT", False) else 0))
             return ForecastingHead(
                 self.head_nf,
-                self.config.forecast_horizon,
+                forecast_horizon,
                 self.config.getattr("head_dropout", 0.1),
             )
         elif task_name == TASKS.EMBED:
@@ -340,60 +343,6 @@ class MOMENT(nn.Module):
     def __call__(self, *args, **kwargs) -> TimeseriesOutputs:
         return self.forward(*args, **kwargs)
 
-    def embed(
-        self,
-        x_enc: torch.Tensor,
-        input_mask: torch.Tensor = None,
-        reduction: str = "mean",
-        **kwargs,
-    ) -> TimeseriesOutputs:
-
-        raise NotImplementedError("Embedding task not implemented.")
-
-        batch_size, n_channels, seq_len = x_enc.shape
-
-        if input_mask is None:
-            input_mask = torch.ones((batch_size, seq_len)).to(x_enc.device)
-
-        x_enc = self.normalizer(x=x_enc, mask=input_mask, mode="norm")
-        x_enc = torch.nan_to_num(x_enc, nan=0, posinf=0, neginf=0)
-
-        input_mask_patch_view = Masking.convert_seq_to_patch_view(
-            input_mask, self.patch_len
-        )
-
-        x_enc = self.tokenizer(x=x_enc)
-
-        enc_in = self.patch_embedding(x_enc, mask=input_mask)
-
-        n_patches = enc_in.shape[2]
-        enc_in = enc_in.reshape(
-            (batch_size * n_channels, n_patches, self.config.d_model)
-        )
-
-        patch_view_mask = Masking.convert_seq_to_patch_view(input_mask, self.patch_len)
-        attention_mask = patch_view_mask.repeat_interleave(n_channels, dim=0)
-        outputs = self.encoder(inputs_embeds=enc_in, attention_mask=attention_mask)
-        enc_out = outputs.last_hidden_state
-
-        enc_out = enc_out.reshape((-1, n_channels, n_patches, self.config.d_model))
-        # [batch_size x n_channels x n_patches x d_model]
-
-        if reduction == "mean":
-            enc_out = enc_out.mean(dim=1, keepdim=False)  # Mean across channels
-            # [batch_size x n_patches x d_model]
-            input_mask_patch_view = input_mask_patch_view.unsqueeze(-1).repeat(
-                1, 1, self.config.d_model
-            )
-            enc_out = (input_mask_patch_view * enc_out).sum(
-                dim=1
-            ) / input_mask_patch_view.sum(dim=1)
-        else:
-            raise NotImplementedError(f"Reduction method {reduction} not implemented.")
-
-        return TimeseriesOutputs(
-            embeddings=enc_out, input_mask=input_mask, metadata=reduction
-        )
 
     def reconstruction(
         self,
@@ -433,6 +382,8 @@ class MOMENT(nn.Module):
 
         # #######################################################################
 
+        # TODO: in embed(), mask is input_mask
+        # if classification, mask is 1. what about input_mask?
         enc_in = self.patch_embedding(x_enc, mask=mask) # should I flatten this before MPT? No, MPT should apply to each channel independently
 
         n_patches = enc_in.shape[2]
@@ -542,8 +493,10 @@ class MOMENT(nn.Module):
         if isinstance(self.encoder, T5StackWithPrefixMulti):
             outputs = self.encoder(n_channels=n_channels, inputs_embeds=enc_in, attention_mask=attention_mask)
         else:
-            outputs = self.encoder(inputs_embeds=enc_in, attention_mask=attention_mask)        
-        
+            # do self.eval, then this is deterministic
+            # https://github.com/huggingface/transformers/issues/695
+            outputs = self.encoder(inputs_embeds=enc_in, attention_mask=attention_mask)  
+                  
         # outputs = self.encoder(n_channels=n_channels, inputs_embeds=enc_in, attention_mask=attention_mask)
         enc_out = outputs.last_hidden_state
         enc_out = enc_out.reshape((-1, n_channels, n_patches, self.config.d_model))
@@ -553,6 +506,11 @@ class MOMENT(nn.Module):
         dec_out = self.fore_head(enc_out)  # [batch_size x n_channels x forecast_horizon]
         #######################################################################
         dec_out = self.normalizer(x=dec_out, mode="denorm")
+
+        # # if using prompt tuning TODO: should add this like imputation?
+        # if isinstance(self.patch_embedding.value_embedding, MPT):
+        #     dec_out = dec_out[:, :, self.patch_len*self.patch_embedding.value_embedding.n_tokens:]
+
 
         return TimeseriesOutputs(input_mask=input_mask, forecast=dec_out)
 
@@ -599,7 +557,7 @@ class MOMENTPipeline(MOMENT, PyTorchModelHubMixin):
         config = Namespace(**kwargs["model_kwargs"])
 
         if config.task_name == TASKS.FORECASTING:
-            if not hasattr(config, "forecast_horizon"):
+            if not hasattr(config, "forecast_horizons"):
                 raise ValueError(
                     "forecast_horizon must be specified for long-horizon forecasting."
                 )
