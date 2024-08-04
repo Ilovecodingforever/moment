@@ -172,6 +172,8 @@ class MOMENT(nn.Module):
         self.seq_len = config.seq_len
         self.patch_len = config.patch_len
 
+        self.visualize_mpt = config.getattr("visualize_mpt", False)
+
         self.normalizer = RevIN(
             num_features=1, affine=config.getattr("revin_affine", False)
         )
@@ -310,6 +312,7 @@ class MOMENT(nn.Module):
             setattr(model_config, 'MPT', self.config.getattr("MPT", False))
             setattr(model_config, 'seq_len', self.config.seq_len)
             setattr(model_config, 'multivariate_projection', self.config.multivariate_projection)
+            setattr(model_config, 'visualize_attention', self.config.getattr("visualize_attention", False))
 
             num_patches = (max(self.config.seq_len, self.config.patch_len) - self.config.patch_len
                         ) // self.config.patch_stride_len + 1
@@ -386,6 +389,9 @@ class MOMENT(nn.Module):
         # if classification, mask is 1. what about input_mask?
         enc_in = self.patch_embedding(x_enc, mask=mask) # should I flatten this before MPT? No, MPT should apply to each channel independently
 
+        if self.visualize_mpt:
+            self.mpt_tokens = enc_in[0, 0, :self.patch_embedding.value_embedding.n_tokens].detach().cpu().numpy()
+
         n_patches = enc_in.shape[2]
         enc_in = enc_in.reshape(
             (batch_size * n_channels, n_patches, self.config.d_model)
@@ -393,7 +399,6 @@ class MOMENT(nn.Module):
 
         patch_view_mask = Masking.convert_seq_to_patch_view(input_mask, self.patch_len)
         attention_mask = patch_view_mask.repeat_interleave(n_channels, dim=0)
-
 
         if self.config.transformer_type == "encoder_decoder":
             # outputs = self.encoder(

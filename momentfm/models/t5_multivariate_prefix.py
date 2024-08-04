@@ -23,6 +23,8 @@ from transformers.models.t5.modeling_t5 import (
     T5ForConditionalGeneration,
 )
 
+import matplotlib.pyplot as plt
+
 
 class T5WithPrefixConfig(T5Config):
     def __init__(
@@ -169,6 +171,14 @@ class T5AttentionWithPrefix(T5Attention):
             raise ValueError('Invalid projection type')
         ################################################
 
+
+
+        if self.config.visualize_attention:
+            scores = attn_output_weights.mean(dim=0)
+            plt.imshow(scores.detach().cpu().numpy())
+            plt.savefig(f"plots/attention/{self.layer_number}.png")
+
+
         # get query states
         query_states = shape(self.q(hidden_states))  # (batch_size, n_heads, seq_length, dim_per_head)
 
@@ -212,6 +222,8 @@ class T5AttentionWithPrefix(T5Attention):
             query_states, key_states.transpose(3, 2)
         )  # equivalent of torch.einsum("bnqd,bnkd->bnqk", query_states, key_states), compatible with onnx op>9
 
+
+        # TODO: since there is no order, shouldn't be here?
         if position_bias is None:
             if not self.has_relative_attention_bias:
                 position_bias = torch.zeros(
@@ -245,6 +257,9 @@ class T5AttentionWithPrefix(T5Attention):
                 position_bias = position_bias + mask  # (batch_size, n_heads, seq_length, key_length)
 
         scores += position_bias
+        
+        # position_bias = None
+        
         attn_weights = nn.functional.softmax(scores.float(), dim=-1).type_as(
             scores
         )  # (batch_size, n_heads, seq_length, key_length)
@@ -258,6 +273,7 @@ class T5AttentionWithPrefix(T5Attention):
 
         attn_output = unshape(torch.matmul(attn_weights, value_states))  # (batch_size, seq_length, dim)
         attn_output = self.o(attn_output)
+
 
         # <CHANGE>  moved one line up
         # </CHANGE>
@@ -286,13 +302,15 @@ class T5LayerCrossAttentionWithPrefix(T5LayerCrossAttention):
 
 
 class T5BlockWithPrefix(T5Block):
-    def __init__(self, config, has_relative_attention_bias=False):
+    def __init__(self, config, has_relative_attention_bias=False, layer_number=None):
         super().__init__(config, has_relative_attention_bias=has_relative_attention_bias)
         self.layer[0] = T5LayerSelfAttentionWithPrefix(
             config, has_relative_attention_bias=has_relative_attention_bias
         )
+        self.layer[0].SelfAttention.layer_number = layer_number
         if self.is_decoder:
             self.layer[1] = T5LayerCrossAttentionWithPrefix(config)
+            self.layer[1].EncDecAttention.layer_number = layer_number
 
 
 class T5StackWithPrefixMulti(T5Stack):
@@ -330,7 +348,7 @@ class T5StackWithPrefixMulti(T5Stack):
 
         self.block = torch.nn.ModuleList(
             [
-                T5BlockWithPrefix(self.config, has_relative_attention_bias=bool(i == 0))
+                T5BlockWithPrefix(self.config, has_relative_attention_bias=bool(i == 0), layer_number=i)
                 for i in range(self.config.num_layers)
             ]
         )
@@ -412,6 +430,9 @@ class T5StackWithPrefixMulti(T5Stack):
             # average across channels, so output is 1 x (time x 1 x d_model)
             # flatten, linear, unflatten
             dim, sample = 64, 16
+            # TODO: instead of sampling, do projection to same space (like itransformer) But this makes it necessary to have same sequence length?
+            # itransformer: embed the whole series into one vector, each channel independently. Then do attention, using this vector as feature
+            # So, you should take the original time series (not the encoding), sample it?, then do attention
             self.shared_prompt_projection_k = nn.Linear(config.d_model, dim, bias=False)
             self.shared_prompt_projection_q = nn.Linear(config.d_model, dim, bias=False)
             self.shared_prompt_projection_v = nn.Linear(config.d_model, dim, bias=False)
@@ -480,7 +501,7 @@ class T5StackWithPrefixMulti(T5Stack):
         # why do both self and cross attention?
         # self attention is for encoder, cross is for decoder (not used)
         for block in self.block:
-            for layer in block.layer:
+            for i, layer in enumerate(block.layer):
                 if isinstance(layer, T5LayerSelfAttentionWithPrefix):
                     layer.SelfAttention.shared_prompt_projection = self.shared_prompt_projection
                     layer.SelfAttention.n_channels = n_channels
@@ -501,7 +522,7 @@ class T5StackWithPrefixMulti(T5Stack):
             for block, k, v, k_cross, v_cross in zip(
                 self.block, prefix_key, prefix_value, prefix_key_cross, prefix_value_cross
             ):
-                for layer in block.layer:
+                for i, layer in enumerate(block.layer):
                     if isinstance(layer, T5LayerSelfAttentionWithPrefix):
                         layer.SelfAttention.prefix_key = k
                         layer.SelfAttention.prefix_value = v
