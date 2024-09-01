@@ -162,6 +162,32 @@ class ForecastingHead(nn.Module):
         return x
 
 
+
+class ClassificationHead(nn.Module):
+    def __init__(
+        self,
+        n_channels: int = 1,
+        d_model: int = 768,
+        n_classes: int = 2,
+        head_dropout: int = 0.1,
+        reduction: str = "concat",
+    ):
+        super().__init__()
+        self.dropout = nn.Dropout(head_dropout)
+        if reduction == "mean":
+            self.linear = nn.Linear(d_model, n_classes)
+        elif reduction == "concat":
+            self.linear = nn.Linear(n_channels * d_model, n_classes)
+        else:
+            raise ValueError(f"Reduction method {reduction} not implemented. Only 'mean' and 'concat' are supported.")
+
+    def forward(self, x, input_mask: torch.Tensor = None):
+        x = torch.mean(x, dim=1)
+        x = self.dropout(x)
+        y = self.linear(x)
+        return y
+
+
 class MOMENT(nn.Module):
     def __init__(self, config: Namespace | dict, **kwargs: dict):
         super().__init__()
@@ -197,9 +223,14 @@ class MOMENT(nn.Module):
 
         # this name must be head in order to load pretrained weights
         self.head = self._get_head(TASKS.RECONSTRUCTION, None)
-        
-        for horizon in config.forecast_horizons:
-            setattr(self, f"fore_head_{horizon}", self._get_head(TASKS.FORECASTING, forecast_horizon=horizon))
+
+        # for horizon in config.forecast_horizons:
+        #     setattr(self, f"fore_head_{horizon}", self._get_head(TASKS.FORECASTING, forecast_horizon=horizon))
+
+        setattr(self, f"fore_head_long", self._get_head(TASKS.FORECASTING, forecast_horizon=config.forecast_horizons[0]))
+        setattr(self, f"fore_head_short", self._get_head(TASKS.FORECASTING, forecast_horizon=config.forecast_horizons[1]))
+
+        self.classification_head = self._get_head(TASKS.CLASSIFICATION, None)
 
         self.emb_head = self._get_head(TASKS.EMBED, None)
         ###################################
@@ -273,6 +304,14 @@ class MOMENT(nn.Module):
             )
         elif task_name == TASKS.EMBED:
             return nn.Identity()
+        elif task_name == TASKS.CLASSIFICATION:
+            return ClassificationHead(
+                self.config.n_channels,
+                self.config.d_model,
+                self.config.num_class,
+                self.config.getattr("dropout", 0.1),
+                reduction = self.config.getattr("reduction", "concat"),
+            )
         else:
             raise NotImplementedError(f"Task {task_name} not implemented.")
 
@@ -493,15 +532,15 @@ class MOMENT(nn.Module):
 
         patch_view_mask = Masking.convert_seq_to_patch_view(input_mask, self.patch_len)
         attention_mask = patch_view_mask.repeat_interleave(n_channels, dim=0)
-        
+
         # if isinstance(self.patch_embedding.value_embedding, MPT):
         if isinstance(self.encoder, T5StackWithPrefixMulti):
             outputs = self.encoder(n_channels=n_channels, inputs_embeds=enc_in, attention_mask=attention_mask)
         else:
             # do self.eval, then this is deterministic
             # https://github.com/huggingface/transformers/issues/695
-            outputs = self.encoder(inputs_embeds=enc_in, attention_mask=attention_mask)  
-                  
+            outputs = self.encoder(inputs_embeds=enc_in, attention_mask=attention_mask)
+
         # outputs = self.encoder(n_channels=n_channels, inputs_embeds=enc_in, attention_mask=attention_mask)
         enc_out = outputs.last_hidden_state
         enc_out = enc_out.reshape((-1, n_channels, n_patches, self.config.d_model))
@@ -518,6 +557,101 @@ class MOMENT(nn.Module):
 
 
         return TimeseriesOutputs(input_mask=input_mask, forecast=dec_out)
+
+
+
+    def classify(
+        self,
+        x_enc: torch.Tensor,
+        input_mask: torch.Tensor = None,
+        reduction: str = "concat",
+        task_name: str = None,
+        **kwargs,
+    ) -> TimeseriesOutputs:
+        batch_size, n_channels, _ = x_enc.shape
+
+        if input_mask is None:
+            input_mask = torch.ones((batch_size, seq_len)).to(x_enc.device)
+
+        x_enc = self.normalizer(x=x_enc, mask=input_mask, mode="norm")
+        x_enc = torch.nan_to_num(x_enc, nan=0, posinf=0, neginf=0)
+
+        x_enc = self.tokenizer(x=x_enc)
+
+        #######################################################################
+        if isinstance(self.patch_embedding.value_embedding, MPT):
+
+            # using multitask prompt tuning
+            # use 0 or 1? Used 0 in multivariate prefix tuning
+            # should use 1. https://discuss.huggingface.co/t/clarification-on-the-attention-mask/1538
+            # In multivariate prefix tuning, 1 and 0 are already inverted
+            mask = torch.concatenate([torch.ones(mask.size(0),
+                                                self.patch_len*self.patch_embedding.value_embedding.n_tokens).to(x_enc.device),
+                                        mask], dim=1)
+            input_mask = torch.concatenate([torch.ones(input_mask.size(0),
+                                                        self.patch_len*self.patch_embedding.value_embedding.n_tokens).to(x_enc.device),
+                                            input_mask], dim=1)
+
+            self.patch_embedding.value_embedding.task_name = task_name
+
+        # #######################################################################
+
+        # TODO: in embed(), mask is input_mask
+        # if classification, mask is 1. what about input_mask?
+        enc_in = self.patch_embedding(x_enc, mask=input_mask) # should I flatten this before MPT? No, MPT should apply to each channel independently
+
+        if self.visualize_mpt:
+            self.mpt_tokens = enc_in[0, 0, :self.patch_embedding.value_embedding.n_tokens].detach().cpu().numpy()
+
+        n_patches = enc_in.shape[2]
+        enc_in = enc_in.reshape(
+            (batch_size * n_channels, n_patches, self.config.d_model)
+        )
+
+        patch_view_mask = Masking.convert_seq_to_patch_view(input_mask, self.patch_len)
+        if patch_view_mask.dim() == 2:
+            attention_mask = patch_view_mask.repeat_interleave(n_channels, dim=0)
+        elif patch_view_mask.dim() == 3:
+            attention_mask = torch.flatten(patch_view_mask, end_dim=-2)
+
+        if self.config.transformer_type == "encoder_decoder":
+            # outputs = self.encoder(
+            #     inputs_embeds=enc_in,
+            #     decoder_inputs_embeds=enc_in,
+            #     attention_mask=attention_mask,
+            # )
+            raise NotImplementedError("Encoder-decoder not implemented for prefix T5.")
+        else:
+            # if isinstance(self.patch_embedding.value_embedding, MPT):
+            if isinstance(self.encoder, T5StackWithPrefixMulti):
+                outputs = self.encoder(n_channels=n_channels, inputs_embeds=enc_in, attention_mask=attention_mask)
+            else:
+                outputs = self.encoder(inputs_embeds=enc_in, attention_mask=attention_mask)
+
+
+        enc_out = outputs.last_hidden_state
+
+        enc_out = enc_out.reshape((-1, n_channels, n_patches, self.config.d_model))
+
+
+        # Mean across channels
+        if reduction == "mean":
+            # [batch_size x n_patches x d_model]
+            enc_out = enc_out.mean(dim=1, keepdim=False)
+        # Concatenate across channels
+        elif reduction == "concat":
+            # [batch_size x n_patches x d_model * n_channels]
+            enc_out = enc_out.permute(0, 2, 3, 1).reshape(
+                batch_size, n_patches, self.config.d_model * n_channels)
+
+        else:
+            raise NotImplementedError(f"Reduction method {reduction} not implemented.")
+
+        logits = self.classification_head(enc_out, input_mask=input_mask)
+
+        return TimeseriesOutputs(embeddings=enc_out, logits=logits, metadata=reduction)
+
+
 
 
     def forward(
@@ -541,6 +675,10 @@ class MOMENT(nn.Module):
             return self.embed(x_enc=x_enc, input_mask=input_mask, **kwargs)
         elif self.task_name == TASKS.FORECASTING:
             return self.forecast(x_enc=x_enc, input_mask=input_mask,
+                                 task_name=task_name,
+                                 **kwargs)
+        elif self.task_name == TASKS.CLASSIFICATION:
+            return self.classify(x_enc=x_enc, input_mask=input_mask,
                                  task_name=task_name,
                                  **kwargs)
         else:
@@ -570,7 +708,7 @@ class MOMENTPipeline(MOMENT, PyTorchModelHubMixin):
     def init(self) -> None: # TODO: what does this do to forecasting task?
         if self.new_task_name != TASKS.RECONSTRUCTION:
             self.task_name = self.new_task_name
-            self.head = self._get_head(self.new_task_name)
+            # self.head = self._get_head(self.new_task_name)
 
         ###################################
         # multi-task prompt tuning

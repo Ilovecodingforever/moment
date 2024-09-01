@@ -64,7 +64,12 @@ class RevIN(nn.Module):
         if mask is None:
             mask = torch.ones((x.shape[0], x.shape[-1]))
         n_channels = x.shape[1]
-        mask = mask.unsqueeze(1).repeat(1, n_channels, 1).bool()
+        
+        if mask.dim() == 2:
+            mask = mask.unsqueeze(1).repeat(1, n_channels, 1)#.bool()
+        
+        mask = mask.bool()
+            
         # Set masked positions to NaN, and unmasked positions are taken from x
         masked_x = torch.where(mask, x, torch.nan)
         self.mean = torch.nanmean(masked_x, dim=-1, keepdim=True).detach()

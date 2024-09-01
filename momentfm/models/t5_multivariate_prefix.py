@@ -120,7 +120,6 @@ class T5AttentionWithPrefix(T5Attention):
         ################################################
         # shared prompt: 1 x (num_heads x num_prefix x d_kv)
 
-        sample = 16
         n_channels = self.n_channels
         _, seq_length, d_model = hidden_states.shape
         batch_size_real = batch_size // n_channels
@@ -144,24 +143,43 @@ class T5AttentionWithPrefix(T5Attention):
 
             # key
             # TODO: is reshape invertible?
-            hidden_states_ = hidden_states.reshape(-1, n_channels, seq_length, d_model)
-            hidden_states_proj = hidden_states_[:, :, ::seq_length//sample, :].transpose(1, 2).reshape(-1, n_channels, d_model)
-            attn_output, attn_output_weights = self.shared_prompt_projection['mha'](self.shared_prompt_projection['q'](hidden_states_proj),
-                                                                                    self.shared_prompt_projection['k'](hidden_states_proj),
-                                                                                    self.shared_prompt_projection['v'](hidden_states_proj))
-            attn_output = attn_output.mean(dim=1).reshape(batch_size_real, sample, -1).flatten(1)
-            shared_prompt_projection_key = self.shared_prompt_projection['unflatten'](self.shared_prompt_projection['linear'](attn_output)).repeat(1, n_channels, 1, 1, 1).flatten(0, 1)
 
-            # value
+            # hidden_states: bs*channel x seq_length x d_model
+
             hidden_states_ = hidden_states.reshape(-1, n_channels, seq_length, d_model)
-            hidden_states_proj = hidden_states_[:, :, ::seq_length//sample, :].transpose(1, 2).reshape(-1, n_channels, d_model)
+            # hidden_states_proj = hidden_states_[:, :, ::seq_length//sample, :].transpose(1, 2).reshape(-1, n_channels, d_model)
+            hidden_states_proj = hidden_states_.transpose(1, 2).reshape(-1, n_channels, d_model)
             attn_output, attn_output_weights = self.shared_prompt_projection['mha'](self.shared_prompt_projection['q'](hidden_states_proj),
                                                                                     self.shared_prompt_projection['k'](hidden_states_proj),
                                                                                     self.shared_prompt_projection['v'](hidden_states_proj))
-            attn_output = attn_output.mean(dim=1).reshape(batch_size_real, sample, -1).flatten(1)
-            shared_prompt_projection_value = self.shared_prompt_projection['unflatten'](self.shared_prompt_projection['linear'](attn_output)).repeat(1, n_channels, 1, 1, 1).flatten(0, 1)
+            # reshape, make it channel x d_kv x time
+            attn_output = attn_output.reshape(batch_size_real, seq_length, n_channels, -1).permute(0, 2, 3, 1)
+            shared_prompt_projection_k = self.shared_prompt_projection['linear_key'](attn_output) # bs x channel x d_kv x (num_prefix*n_heads)
+            # shared_prompt_projection = shared_prompt_projection.permu
+            
+            # repreat self.config.num_heads times, on last dimension
+            # shared_prompt_projection_k = shared_prompt_projection_k.unsqueeze(-1).repeat(1, 1, 1, 1, self.config.num_heads)
+            
+            shared_prompt_projection_key = shared_prompt_projection_k.reshape(batch_size_real, n_channels, -1, self.num_prefix, self.config.num_heads).permute(0, 4, 1, 3, 2).reshape(batch_size_real, self.config.num_heads, n_channels*self.num_prefix, -1).repeat_interleave(n_channels, dim=0)
+            #             # bsz, num_heads, num_prefix, d_kv
+            
+            
+            # TODO: now sequence length is n_channels*self.num_prefix. should I project this to something shorter?
+            
+            
+
+            # TODO
+            shared_prompt_projection_v = self.shared_prompt_projection['linear_value'](attn_output)
+            shared_prompt_projection_value = shared_prompt_projection_v.reshape(batch_size_real, n_channels, -1, self.num_prefix, self.config.num_heads).permute(0, 4, 1, 3, 2).reshape(batch_size_real, self.config.num_heads, n_channels*self.num_prefix, -1).repeat_interleave(n_channels, dim=0)
+
+            if self.config.visualize_attention:
+                scores = attn_output_weights.mean(dim=0)
+                plt.imshow(scores.detach().cpu().numpy())
+                plt.savefig(f"plots/attention/{self.layer_number}.png")
+
 
         elif self.config.multivariate_projection == 'linear':
+            sample = 16
             hidden_states_ = hidden_states.reshape(-1, n_channels, seq_length, d_model)
             hidden_states_proj = hidden_states_[:, :, ::seq_length//sample, :].reshape(-1, n_channels, sample*d_model)
             shared_prompt_projection_key = self.shared_prompt_projection['unflatten'](torch.mean(self.shared_prompt_projection['linear'](hidden_states_proj), dim=1)).repeat(1, n_channels, 1, 1, 1).flatten(0, 1)
@@ -170,13 +188,6 @@ class T5AttentionWithPrefix(T5Attention):
         else:
             raise ValueError('Invalid projection type')
         ################################################
-
-
-
-        if self.config.visualize_attention:
-            scores = attn_output_weights.mean(dim=0)
-            plt.imshow(scores.detach().cpu().numpy())
-            plt.savefig(f"plots/attention/{self.layer_number}.png")
 
 
         # get query states
@@ -196,12 +207,12 @@ class T5AttentionWithPrefix(T5Attention):
 
         # prefix tuning
 
-        if self.config.prefix_tuning:
-            key_states = torch.cat([self.prefix_key, shared_prompt_projection_key, key_states], dim=2)     # self.prefix_key: bsz, num_heads, num_prefix, d_kv
-            value_states = torch.cat([self.prefix_value, shared_prompt_projection_value, value_states], dim=2)
-        else:
-            key_states = torch.cat([shared_prompt_projection_key, key_states], dim=2)     # self.prefix_key: bsz, num_heads, num_prefix, d_kv
-            value_states = torch.cat([shared_prompt_projection_value, value_states], dim=2)
+        # if self.config.prefix_tuning:
+        #     key_states = torch.cat([self.prefix_key, shared_prompt_projection_key, key_states], dim=2)     # self.prefix_key: bsz, num_heads, num_prefix, d_kv
+        #     value_states = torch.cat([self.prefix_value, shared_prompt_projection_value, value_states], dim=2)
+        # else:
+        key_states = torch.cat([shared_prompt_projection_key, key_states], dim=2)     # self.prefix_key: bsz, num_heads, num_prefix, d_kv
+        value_states = torch.cat([shared_prompt_projection_value, value_states], dim=2)
 
 
 
@@ -211,7 +222,8 @@ class T5AttentionWithPrefix(T5Attention):
 
         if mask is not None:
             prefix_mask = torch.zeros(
-                batch_size, 1, mask.size(2), self.num_prefix*(2 if self.config.prefix_tuning else 1), device=hidden_states.device
+                # batch_size, 1, mask.size(2), self.num_prefix*(2 if self.config.prefix_tuning else 1), device=hidden_states.device
+                batch_size, 1, mask.size(2), self.num_prefix*(n_channels), device=hidden_states.device
                 # batch_size, 1, mask.size(2), self.num_prefix, device=hidden_states.device
             )
             mask = torch.cat([prefix_mask, mask], dim=-1)
@@ -243,7 +255,8 @@ class T5AttentionWithPrefix(T5Attention):
             position_bias = torch.cat(
                 [
                     torch.zeros(
-                        position_bias.shape[:3] + (self.num_prefix*(2 if self.config.prefix_tuning else 1),),
+                        # position_bias.shape[:3] + (self.num_prefix*(2 if self.config.prefix_tuning else 1),),
+                        position_bias.shape[:3] + (self.num_prefix*(n_channels),),
                         # position_bias.shape[:3] + (self.num_prefix,),
                         device=position_bias.device,
                     ),
@@ -257,9 +270,9 @@ class T5AttentionWithPrefix(T5Attention):
                 position_bias = position_bias + mask  # (batch_size, n_heads, seq_length, key_length)
 
         scores += position_bias
-        
+
         # position_bias = None
-        
+
         attn_weights = nn.functional.softmax(scores.float(), dim=-1).type_as(
             scores
         )  # (batch_size, n_heads, seq_length, key_length)
@@ -429,25 +442,48 @@ class T5StackWithPrefixMulti(T5Stack):
             # do multihead attention
             # average across channels, so output is 1 x (time x 1 x d_model)
             # flatten, linear, unflatten
-            dim, sample = 64, 16
-            # TODO: instead of sampling, do projection to same space (like itransformer) But this makes it necessary to have same sequence length?
+            # dim, sample = config.d_model, 16
+            # TODO: instead of sampling, do projection to same space (like itransformer) But this makes it necessary to have same sequence length? should be fine because you split and pad anyways
             # itransformer: embed the whole series into one vector, each channel independently. Then do attention, using this vector as feature
             # So, you should take the original time series (not the encoding), sample it?, then do attention
-            self.shared_prompt_projection_k = nn.Linear(config.d_model, dim, bias=False)
-            self.shared_prompt_projection_q = nn.Linear(config.d_model, dim, bias=False)
-            self.shared_prompt_projection_v = nn.Linear(config.d_model, dim, bias=False)
+            # what I have here is to encode at each timestamp
+            self.shared_prompt_projection_k = nn.Linear(config.d_model, config.d_kv, bias=False)
+            self.shared_prompt_projection_q = nn.Linear(config.d_model, config.d_kv, bias=False)  # TODO: should dim be smaller than d_kv?
+            self.shared_prompt_projection_v = nn.Linear(config.d_model, config.d_kv, bias=False)
+
             # batch size: time, length: variable, E: 1024
-            self.shared_prompt_projection_mha = nn.MultiheadAttention(dim, num_heads=1, batch_first=True)
-            self.shared_prompt_projection_linear = nn.Linear(sample*dim, config.num_heads * config.num_prefix * config.d_kv)
-            self.unflatten = nn.Unflatten(1, (1, config.num_heads, config.num_prefix, config.d_kv))
+            self.shared_prompt_projection_mha = nn.MultiheadAttention(config.d_kv, num_heads=1, batch_first=True,
+                                                                      kdim=config.d_kv, vdim=config.d_kv)
+            # out: time x channel x d_kv
+
+            # reshape, make it bs x channel x d_kv x time
+
+            # self.shared_prompt_projection_linear = nn.Linear(sample*dim, config.num_heads * config.num_prefix * config.d_kv)
+            # https://d2l.ai/chapter_attention-mechanisms-and-transformers/multihead-attention.html
+            # self.shared_prompt_projection_linear_key = nn.Linear(config.num_patches, config.num_prefix*config.num_heads)  # TODO: move this to before attention?
+            # self.shared_prompt_projection_linear_value = nn.Linear(config.num_patches, config.num_prefix*config.num_heads)
+
+            self.shared_prompt_projection_linear_key = nn.Linear(config.num_patches, config.num_prefix*config.num_heads)  # TODO: move this to before attention?
+            self.shared_prompt_projection_linear_value = nn.Linear(config.num_patches, config.num_prefix*config.num_heads)
+
+
+            # out: bs x channel x d_kv x (num_prefix*n_heads)
+
+            # reshape, make it bs x 1 x 1 x (channel * config.num_prefix) x config.d_kv
+            #
+
+
+            # self.unflatten = nn.Unflatten(1, (1, config.num_heads, config.num_prefix, config.d_kv))
+            # self.unflatten = nn.Unflatten(1, (1, config.num_prefix, config.d_kv))
 
             self.shared_prompt_projection = {
                 'k': self.shared_prompt_projection_k,
                 'q': self.shared_prompt_projection_q,
                 'v': self.shared_prompt_projection_v,
                 'mha': self.shared_prompt_projection_mha,
-                'linear': self.shared_prompt_projection_linear,
-                'unflatten': self.unflatten
+                'linear_key': self.shared_prompt_projection_linear_key,
+                'linear_value': self.shared_prompt_projection_linear_value, 
+                # 'unflatten': self.unflatten
             }
 
 

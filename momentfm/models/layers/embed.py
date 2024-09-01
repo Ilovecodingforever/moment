@@ -219,11 +219,16 @@ class PatchEmbedding(nn.Module):
         ).unsqueeze(-1)
         # mask : [batch_size x n_patches x 1]
         n_channels = x.shape[1]
-        mask = (
-            mask.repeat_interleave(self.d_model, dim=-1)
-            .unsqueeze(1)
-            .repeat(1, n_channels, 1, 1)
-        )
+        
+        if mask.dim() == 2:
+            mask = (
+                mask.repeat_interleave(self.d_model, dim=-1)
+                .unsqueeze(1)
+                .repeat(1, n_channels, 1, 1)
+            )
+        elif mask.dim() == 3:
+            mask = mask.repeat_interleave(self.d_model, dim=-1)
+                        
         # mask : [batch_size x n_channels x n_patches x d_model]
 
         # Input encoding
