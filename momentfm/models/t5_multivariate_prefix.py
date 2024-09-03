@@ -144,8 +144,8 @@ class T5AttentionWithPrefix(T5Attention):
             # key
             # TODO: is reshape invertible?
 
-            # hidden_states: bs*channel x seq_length x d_model
 
+            # hidden_states: bs*channel x seq_length x d_model
             hidden_states_ = hidden_states.reshape(-1, n_channels, seq_length, d_model)
             # hidden_states_proj = hidden_states_[:, :, ::seq_length//sample, :].transpose(1, 2).reshape(-1, n_channels, d_model)
             hidden_states_proj = hidden_states_.transpose(1, 2).reshape(-1, n_channels, d_model)
@@ -156,17 +156,13 @@ class T5AttentionWithPrefix(T5Attention):
             attn_output = attn_output.reshape(batch_size_real, seq_length, n_channels, -1).permute(0, 2, 3, 1)
             shared_prompt_projection_k = self.shared_prompt_projection['linear_key'](attn_output) # bs x channel x d_kv x (num_prefix*n_heads)
             # shared_prompt_projection = shared_prompt_projection.permu
-            
+
             # repreat self.config.num_heads times, on last dimension
             # shared_prompt_projection_k = shared_prompt_projection_k.unsqueeze(-1).repeat(1, 1, 1, 1, self.config.num_heads)
-            
+
             shared_prompt_projection_key = shared_prompt_projection_k.reshape(batch_size_real, n_channels, -1, self.num_prefix, self.config.num_heads).permute(0, 4, 1, 3, 2).reshape(batch_size_real, self.config.num_heads, n_channels*self.num_prefix, -1).repeat_interleave(n_channels, dim=0)
             #             # bsz, num_heads, num_prefix, d_kv
-            
-            
             # TODO: now sequence length is n_channels*self.num_prefix. should I project this to something shorter?
-            
-            
 
             # TODO
             shared_prompt_projection_v = self.shared_prompt_projection['linear_value'](attn_output)
@@ -176,6 +172,32 @@ class T5AttentionWithPrefix(T5Attention):
                 scores = attn_output_weights.mean(dim=0)
                 plt.imshow(scores.detach().cpu().numpy())
                 plt.savefig(f"plots/attention/{self.layer_number}.png")
+
+
+
+            # hidden_states: bs*channel x seq_length x d_model
+            # reshape, make it bs x channel x seq_length x d_model
+            # project d_model to num_prefix, then flatten (bs x channel x (seq_length*num_prefix))
+            # project to key, value, query, (bs x channel x d_kv)
+            # multihead attention, bs x channel x d_kv
+            # project, bs x channel x (n_heads*d_kv)
+            # reshape and flatten, (bs x n_heads x channel x d_kv)
+
+
+            # hidden_states_ = hidden_states.reshape(-1, n_channels, seq_length, d_model)
+            # hidden_states_proj = self.shared_prompt_projection['prefix_proj'](hidden_states_).reshape(batch_size_real, n_channels, -1)
+
+            # attn_output, attn_output_weights = self.shared_prompt_projection['mha'](self.shared_prompt_projection['q'](hidden_states_proj),
+            #                                                                         self.shared_prompt_projection['k'](hidden_states_proj),
+            #                                                                         self.shared_prompt_projection['v'](hidden_states_proj))
+
+            # shared_prompt_projection_k = self.shared_prompt_projection['linear_key'](attn_output)
+            # shared_prompt_projection_key = shared_prompt_projection_k.reshape(batch_size_real, n_channels, self.config.num_heads, -1).permute(0, 2, 1, 3).repeat_interleave(n_channels, dim=0)
+
+            # shared_prompt_projection_v = self.shared_prompt_projection['linear_value'](attn_output)
+            # shared_prompt_projection_value = shared_prompt_projection_v.reshape(batch_size_real, n_channels, self.config.num_heads, -1).permute(0, 2, 1, 3).repeat_interleave(n_channels, dim=0)
+
+
 
 
         elif self.config.multivariate_projection == 'linear':
@@ -223,7 +245,8 @@ class T5AttentionWithPrefix(T5Attention):
         if mask is not None:
             prefix_mask = torch.zeros(
                 # batch_size, 1, mask.size(2), self.num_prefix*(2 if self.config.prefix_tuning else 1), device=hidden_states.device
-                batch_size, 1, mask.size(2), self.num_prefix*(n_channels), device=hidden_states.device
+                # batch_size, 1, mask.size(2), self.num_prefix*(n_channels), device=hidden_states.device
+                batch_size, 1, mask.size(2), (n_channels), device=hidden_states.device
                 # batch_size, 1, mask.size(2), self.num_prefix, device=hidden_states.device
             )
             mask = torch.cat([prefix_mask, mask], dim=-1)
@@ -256,7 +279,8 @@ class T5AttentionWithPrefix(T5Attention):
                 [
                     torch.zeros(
                         # position_bias.shape[:3] + (self.num_prefix*(2 if self.config.prefix_tuning else 1),),
-                        position_bias.shape[:3] + (self.num_prefix*(n_channels),),
+                        # position_bias.shape[:3] + (self.num_prefix*(n_channels),),
+                        position_bias.shape[:3] + (n_channels, ),
                         # position_bias.shape[:3] + (self.num_prefix,),
                         device=position_bias.device,
                     ),
@@ -430,6 +454,53 @@ class T5StackWithPrefixMulti(T5Stack):
 
 
         elif config.multivariate_projection == 'attention':
+
+            # hidden_states: bs*channel x seq_length x d_model
+            # reshape, make it bs x channel x seq_length x d_model
+            # project d_model to num_prefix, then flatten (bs x channel x (seq_length*num_prefix))
+            # project to key, value, query, (bs x channel x d_kv)
+            # multihead attention, bs x channel x d_kv
+            # project, bs x channel x (n_heads*d_model)
+            # reshape and flatten, (bs x n_heads x channel x d_model)
+
+
+            # hidden_states: bs*channel x seq_length x d_model
+            # reshape, make it bs x channel x seq_length x d_model
+            # project d_model to num_prefix, then flatten (bs x channel x (seq_length*num_prefix))
+            # project to key, value, query, (bs x channel x d_kv)
+            # multihead attention, bs x channel x d_kv
+            # project, bs x channel x (n_heads*d_model)
+            # reshape and flatten, (bs x n_heads x channel x d_model)
+
+
+
+            # self.prefix_proj = nn.Linear(config.d_model, config.num_prefix)
+
+            # self.shared_prompt_projection_k = nn.Linear(config.num_prefix*config.num_patches, config.d_kv, bias=False)
+            # self.shared_prompt_projection_q = nn.Linear(config.num_prefix*config.num_patches, config.d_kv, bias=False)
+            # self.shared_prompt_projection_v = nn.Linear(config.num_prefix*config.num_patches, config.d_kv, bias=False)
+
+            # self.shared_prompt_projection_mha = nn.MultiheadAttention(config.d_kv, num_heads=1, batch_first=True,
+            #                                                           kdim=config.d_kv, vdim=config.d_kv)
+
+            # self.shared_prompt_projection_linear_key = nn.Linear(config.d_kv, config.d_kv*config.num_heads)  # TODO: move this to before attention?
+            # self.shared_prompt_projection_linear_value = nn.Linear(config.d_kv, config.d_kv*config.num_heads)
+
+
+            # self.shared_prompt_projection = {
+            #     'k': self.shared_prompt_projection_k,
+            #     'q': self.shared_prompt_projection_q,
+            #     'v': self.shared_prompt_projection_v,
+            #     'mha': self.shared_prompt_projection_mha,
+            #     'linear_key': self.shared_prompt_projection_linear_key,
+            #     'linear_value': self.shared_prompt_projection_linear_value,
+            #     'prefix_proj': self.prefix_proj
+            # }
+
+
+
+
+
             # TODO: can average across channel dimension in the end?
             # https://stackoverflow.com/questions/62705268/why-bert-transformer-uses-cls-token-for-classification-instead-of-average-over
 
@@ -470,11 +541,6 @@ class T5StackWithPrefixMulti(T5Stack):
             # out: bs x channel x d_kv x (num_prefix*n_heads)
 
             # reshape, make it bs x 1 x 1 x (channel * config.num_prefix) x config.d_kv
-            #
-
-
-            # self.unflatten = nn.Unflatten(1, (1, config.num_heads, config.num_prefix, config.d_kv))
-            # self.unflatten = nn.Unflatten(1, (1, config.num_prefix, config.d_kv))
 
             self.shared_prompt_projection = {
                 'k': self.shared_prompt_projection_k,
@@ -482,22 +548,9 @@ class T5StackWithPrefixMulti(T5Stack):
                 'v': self.shared_prompt_projection_v,
                 'mha': self.shared_prompt_projection_mha,
                 'linear_key': self.shared_prompt_projection_linear_key,
-                'linear_value': self.shared_prompt_projection_linear_value, 
-                # 'unflatten': self.unflatten
+                'linear_value': self.shared_prompt_projection_linear_value,
             }
 
-
-
-            # self.shared_prompt_projection = nn.Sequential(
-            #                                         Sample(),
-            #                                         # nn.Linear(config.d_model, 1),
-            #                                         # nn.Flatten(start_dim=1),
-            #                                         nn.MultiheadAttention(16, num_heads=1, batch_first=False),  # batch size: time, length: variable, E: 1024
-            #                                         # TODO: tanh? relu?
-
-            #                                         nn.Linear(16*7, 1),
-            #                                         # TODO: sequence length is not even variable
-            # )
 
         else:
             raise ValueError('Invalid projection type')
