@@ -222,17 +222,17 @@ class MOMENT(nn.Module):
 
 
         # this name must be head in order to load pretrained weights
-        self.head = self._get_head(TASKS.RECONSTRUCTION, None)
+        # self.head = self._get_head(TASKS.RECONSTRUCTION, None)
 
         # for horizon in config.forecast_horizons:
         #     setattr(self, f"fore_head_{horizon}", self._get_head(TASKS.FORECASTING, forecast_horizon=horizon))
 
         setattr(self, f"fore_head_long", self._get_head(TASKS.FORECASTING, forecast_horizon=config.forecast_horizons[0]))
-        setattr(self, f"fore_head_short", self._get_head(TASKS.FORECASTING, forecast_horizon=config.forecast_horizons[1]))
+        # setattr(self, f"fore_head_short", self._get_head(TASKS.FORECASTING, forecast_horizon=config.forecast_horizons[1]))
 
         self.classification_head = self._get_head(TASKS.CLASSIFICATION, None)
 
-        self.emb_head = self._get_head(TASKS.EMBED, None)
+        # self.emb_head = self._get_head(TASKS.EMBED, None)
         ###################################
 
         # Frozen parameters
@@ -334,9 +334,16 @@ class MOMENT(nn.Module):
 
         model_config = transformer_backbone.config
 
+        # https://github.com/huggingface/transformers/issues/21381
         # if config.getattr("enable_gradient_checkpointing", True):
         #     transformer_backbone.gradient_checkpointing_enable()
         #     logging.info("Enabling gradient checkpointing.")
+        if config.getattr("enable_gradient_checkpointing", True):
+            from functools import partial
+            notfailing_checkpoint = partial(torch.utils.checkpoint.checkpoint, use_reentrant=False)
+            torch.utils.checkpoint.checkpoint = notfailing_checkpoint
+            transformer_backbone.gradient_checkpointing_enable()
+            logging.info("Enabling gradient checkpointing.")
 
         #######################################################################
         # prefix tuning
@@ -352,6 +359,7 @@ class MOMENT(nn.Module):
             setattr(model_config, 'seq_len', self.config.seq_len)
             setattr(model_config, 'multivariate_projection', self.config.multivariate_projection)
             setattr(model_config, 'visualize_attention', self.config.getattr("visualize_attention", False))
+            setattr(model_config, 'n_channels', self.config.getattr("n_channels", False))
 
             num_patches = (max(self.config.seq_len, self.config.patch_len) - self.config.patch_len
                         ) // self.config.patch_stride_len + 1

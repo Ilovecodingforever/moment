@@ -124,6 +124,8 @@ class T5AttentionWithPrefix(T5Attention):
         _, seq_length, d_model = hidden_states.shape
         batch_size_real = batch_size // n_channels
 
+        num_prefix = self.num_prefix
+
         # TODO: ignore MPT when doing deep prompt?
         if self.config.multivariate_projection == 'attention':
             # TODO: can average across channel dimension in the end?
@@ -172,6 +174,38 @@ class T5AttentionWithPrefix(T5Attention):
 
 
         # TODO: mix on time dimension, not channel dimension. then project channel dimension to num_prefix
+
+
+        elif self.config.multivariate_projection == 'vanilla':
+            shared_prompt_projection_key = self.prefix_key
+            shared_prompt_projection_value = self.prefix_value
+
+
+        elif self.config.multivariate_projection == 'residual':
+            hidden_states_ = hidden_states.reshape(-1, n_channels, seq_length, d_model)
+            # hidden_states_proj = hidden_states_[:, :, ::seq_length//sample, :].transpose(1, 2).reshape(-1, n_channels, d_model)
+            hidden_states_proj = hidden_states_.transpose(1, 2).reshape(-1, n_channels, d_model)
+            attn_output, attn_output_weights = self.shared_prompt_projection['mha'](self.shared_prompt_projection['q'](hidden_states_proj),
+                                                                                    self.shared_prompt_projection['k'](hidden_states_proj),
+                                                                                    self.shared_prompt_projection['v'](hidden_states_proj))
+            # reshape, make it channel x d_kv x time
+            attn_output = attn_output.reshape(batch_size_real, seq_length, n_channels, -1).permute(0, 2, 3, 1)
+            shared_prompt_projection_k = self.shared_prompt_projection['linear_key'](attn_output) # bs x channel x d_kv x (num_prefix*n_heads)
+            # shared_prompt_projection = shared_prompt_projection.permu
+
+            # repreat self.config.num_heads times, on last dimension
+            shared_prompt_projection_key = shared_prompt_projection_k.reshape(batch_size_real, n_channels, -1, self.num_prefix, self.config.num_heads).permute(0, 4, 1, 3, 2).reshape(batch_size_real, self.config.num_heads, n_channels*self.num_prefix, -1).repeat_interleave(n_channels, dim=0)
+            #             # bsz, num_heads, num_prefix, d_kv
+            # TODO: now sequence length is n_channels*self.num_prefix. should I project this to something shorter?
+
+            shared_prompt_projection_v = self.shared_prompt_projection['linear_value'](attn_output)
+            shared_prompt_projection_value = shared_prompt_projection_v.reshape(batch_size_real, n_channels, -1, self.num_prefix, self.config.num_heads).permute(0, 4, 1, 3, 2).reshape(batch_size_real, self.config.num_heads, n_channels*self.num_prefix, -1).repeat_interleave(n_channels, dim=0)
+
+            # shared_prompt_projection_key = torch.cat([self.prefix_key, shared_prompt_projection_key], dim=-2)
+            # shared_prompt_projection_value = torch.cat([self.prefix_value, shared_prompt_projection_value], dim=-2)
+            shared_prompt_projection_key = shared_prompt_projection_key + self.prefix_key
+            shared_prompt_projection_value = shared_prompt_projection_value + self.prefix_value
+            # num_prefix *= 2
 
 
         elif self.config.multivariate_projection == 'linear':
@@ -223,7 +257,7 @@ class T5AttentionWithPrefix(T5Attention):
         if mask is not None:
             prefix_mask = torch.zeros(
                 # batch_size, 1, mask.size(2), self.num_prefix*(2 if self.config.prefix_tuning else 1), device=hidden_states.device
-                batch_size, 1, mask.size(2), self.num_prefix*(n_channels), device=hidden_states.device
+                batch_size, 1, mask.size(2), num_prefix*(n_channels), device=hidden_states.device
                 # batch_size, 1, mask.size(2), (n_channels if self.config.multivariate_projection == 'attention' else self.num_prefix), device=hidden_states.device
                 # batch_size, 1, mask.size(2), self.num_prefix, device=hidden_states.device
             )
@@ -257,7 +291,7 @@ class T5AttentionWithPrefix(T5Attention):
                 [
                     torch.zeros(
                         # position_bias.shape[:3] + (self.num_prefix*(2 if self.config.prefix_tuning else 1),),
-                        position_bias.shape[:3] + (self.num_prefix*(n_channels),),
+                        position_bias.shape[:3] + (num_prefix*(n_channels),),
                         # position_bias.shape[:3] + (n_channels if self.config.multivariate_projection == 'attention' else self.num_prefix, ),
                         # position_bias.shape[:3] + (self.num_prefix,),
                         device=position_bias.device,
@@ -332,7 +366,6 @@ class T5StackWithPrefixMulti(T5Stack):
     def __init__(self, config, embed_tokens=None):
         super().__init__(config, embed_tokens=embed_tokens)
         # prefix tuning - reparam 'trick'
-        self.input_tokens = torch.arange(self.config.num_prefix)
         per_layer_dim = self.config.num_heads * self.config.d_kv
         total_dim = self.config.num_layers * 2 * per_layer_dim
 
@@ -409,7 +442,7 @@ class T5StackWithPrefixMulti(T5Stack):
             }
 
 
-        elif config.multivariate_projection == 'attention':
+        if config.multivariate_projection == 'attention' or config.multivariate_projection == 'residual':
 
             # TODO: can average across channel dimension in the end?
             # https://stackoverflow.com/questions/62705268/why-bert-transformer-uses-cls-token-for-classification-instead-of-average-over
@@ -433,7 +466,7 @@ class T5StackWithPrefixMulti(T5Stack):
             self.shared_prompt_projection_v = nn.Linear(config.d_model, config.d_kv, bias=False)
 
             # batch size: time, length: variable, E: 1024
-            self.shared_prompt_projection_mha = nn.MultiheadAttention(config.d_kv, num_heads=1, batch_first=True,
+            self.shared_prompt_projection_mha = nn.MultiheadAttention(config.d_kv, num_heads=4, batch_first=True,
                                                                       kdim=config.d_kv, vdim=config.d_kv)
             # out: time x channel x d_kv
             # reshape, make it bs x channel x d_kv x time
@@ -454,9 +487,23 @@ class T5StackWithPrefixMulti(T5Stack):
                 'linear_value': self.shared_prompt_projection_linear_value,
             }
 
+        if config.multivariate_projection == 'vanilla' or config.multivariate_projection == 'residual':
+            self.input_tokens = torch.arange(self.config.num_prefix*self.config.n_channels)
+            reparam_dim = 32
+            self.prompt_embed = (
+                nn.Sequential(
+                    nn.Embedding(self.config.num_prefix*self.config.n_channels, per_layer_dim),
+                    nn.Linear(per_layer_dim, reparam_dim),
+                    nn.Tanh(),
+                    nn.Linear(reparam_dim, total_dim),
+                )
+                # if self.config.reparam
+                # else nn.Embedding(self.config.num_prefix, total_dim)
+            )
 
-        else:
-            raise ValueError('Invalid projection type')
+
+        # else:
+        #     raise ValueError('Invalid projection type')
 
 
     class Transpose(torch.nn.Module):
@@ -474,7 +521,7 @@ class T5StackWithPrefixMulti(T5Stack):
         prefix = embedding(input_tokens)  # batch, seq, layer * embed * 2
         prefix = prefix.view(
             bsz,
-            self.config.num_prefix,
+            self.config.num_prefix*self.config.n_channels,
             self.config.num_layers,
             2,
             self.config.num_heads,
@@ -492,18 +539,20 @@ class T5StackWithPrefixMulti(T5Stack):
         # should be a reference. weigths are updated. Also id(self.shared_prompt_projection) are the same
         # why do both self and cross attention?
         # self attention is for encoder, cross is for decoder (not used)
-        for block in self.block:
-            for i, layer in enumerate(block.layer):
-                if isinstance(layer, T5LayerSelfAttentionWithPrefix):
-                    layer.SelfAttention.shared_prompt_projection = self.shared_prompt_projection
-                    layer.SelfAttention.n_channels = n_channels
-                if isinstance(layer, T5LayerCrossAttentionWithPrefix):
-                    layer.EncDecAttention.shared_prompt_projection = self.shared_prompt_projection
-                    layer.EncDecAttention.n_channels = n_channels
+        if self.config.multivariate_projection == 'attention' or self.config.multivariate_projection == 'residual':
+            for block in self.block:
+                for i, layer in enumerate(block.layer):
+                    if isinstance(layer, T5LayerSelfAttentionWithPrefix):
+                        layer.SelfAttention.shared_prompt_projection = self.shared_prompt_projection
+                        layer.SelfAttention.n_channels = n_channels
+                    if isinstance(layer, T5LayerCrossAttentionWithPrefix):
+                        layer.EncDecAttention.shared_prompt_projection = self.shared_prompt_projection
+                        layer.EncDecAttention.n_channels = n_channels
 
-        if self.config.prefix_tuning:
+        # if self.config.prefix_tuning:
+        if self.config.multivariate_projection == 'vanilla' or self.config.multivariate_projection == 'residual': 
 
-            prefix_key, prefix_value = self.generate_prefix_item(inputs_embeds, self.prefix_embed)
+            prefix_key, prefix_value = self.generate_prefix_item(inputs_embeds, self.prompt_embed)
             kwargs['use_cache'] = False
         ################################################
             prefix_key_cross = prefix_value_cross = [None] * len(prefix_key)
@@ -518,9 +567,11 @@ class T5StackWithPrefixMulti(T5Stack):
                     if isinstance(layer, T5LayerSelfAttentionWithPrefix):
                         layer.SelfAttention.prefix_key = k
                         layer.SelfAttention.prefix_value = v
+                        layer.SelfAttention.n_channels = n_channels
                     if isinstance(layer, T5LayerCrossAttentionWithPrefix):
                         layer.EncDecAttention.prefix_key = k_cross
                         layer.EncDecAttention.prefix_value = v_cross
+                        layer.EncDecAttention.n_channels = n_channels
 
 
         output = super().forward(input_ids=input_ids, inputs_embeds=inputs_embeds, **kwargs)
