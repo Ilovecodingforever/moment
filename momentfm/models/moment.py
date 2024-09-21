@@ -38,92 +38,6 @@ from momentfm.models.t5_multivariate_prefix import T5StackWithPrefixMulti, T5For
 
 
 
-class MPT(nn.Module):
-    """
-    multitask prompt tuning
-    """
-    def __init__(self,
-                wte: nn.Module,
-                tasks: list,
-                n_tokens: int = 10,
-                random_range: float = 0.5,
-                hidden_size: int = 64):
-        """appends learned embedding to
-
-        Args:
-            wte (nn.Embedding): original transformer word embedding
-            n_tokens (int, optional): number of tokens for task. Defaults to 10.
-            random_range (float, optional): range to init embedding (if not initialize from vocab).
-                            Defaults to 0.5.
-            initialize_from_vocab (bool, optional): initalizes from default vocab. Defaults to True.
-        """
-        super().__init__()
-        self.wte = wte
-        self.n_tokens = n_tokens
-
-        self.hidden_size = hidden_size
-
-        self.mpt_mlp = nn.Linear(self.hidden_size, wte.weight.size(0))
-
-        self.shared_prompt = nn.parameter.Parameter(self.initialize_embedding(n_tokens,
-                                                                               self.hidden_size,
-                                                                               random_range))
-
-        self.tasks = tasks
-        self.task_prompt = nn.ParameterDict({task: nn.ParameterDict({
-            'u': nn.parameter.Parameter(self.initialize_embedding(n_tokens,
-                                                                    1,
-                                                                    random_range)),
-            'v': nn.parameter.Parameter(self.initialize_embedding(1,
-                                                                    self.hidden_size,
-                                                                    random_range)),
-            }) for task in tasks})
-
-        self.task_name = None
-
-
-    def initialize_embedding(self,
-                             i: int,
-                             j: int,
-                             random_range: float = 0.5, ):
-        """initializes learned embedding
-        Args:
-            same as __init__
-        Returns:
-            torch.float: initialized using original schemes
-        """
-        return torch.FloatTensor(i, j).uniform_(-random_range, random_range)
-
-
-    def forward(self, tokens):
-        """run forward pass
-        Args:
-            tokens (torch.long): input tokens before encoding
-        Returns:
-            torch.float: encoding of text concatenated with learned task specifc embedding
-        """
-
-        task = self.task_name
-
-        input_embedding = self.wte(tokens)
-
-        u = self.task_prompt[task]['u']
-        v = self.task_prompt[task]['v']
-
-        learned_embedding = self.mpt_mlp(torch.matmul(u, v) * self.shared_prompt)
-
-        # n_batches x features x n_patches x embedding_size
-        learned_embedding = learned_embedding.repeat(input_embedding.size(0),
-                                                     input_embedding.size(1), 1, 1)
-
-        self.task_name = None
-
-        return torch.cat([learned_embedding, input_embedding], 2)
-
-##############################
-
-
-
 class PretrainHead(nn.Module):
     def __init__(
         self,
@@ -198,8 +112,6 @@ class MOMENT(nn.Module):
         self.seq_len = config.seq_len
         self.patch_len = config.patch_len
 
-        self.visualize_mpt = config.getattr("visualize_mpt", False)
-
         self.normalizer = RevIN(
             num_features=1, affine=config.getattr("revin_affine", False)
         )
@@ -219,20 +131,13 @@ class MOMENT(nn.Module):
         self.mask_generator = Masking(mask_ratio=config.getattr("mask_ratio", 0.0))
         self.encoder = self._get_transformer_backbone(config)
         ###################################
+        if self.task_name == TASKS.FORECASTING:
+            self.head = self._get_head(TASKS.FORECASTING, forecast_horizon=config.forecast_horizon)
+        elif self.task_name == TASKS.CLASSIFICATION:
+            self.head = self._get_head(TASKS.CLASSIFICATION, None)
+        else:
+            raise NotImplementedError(f"Task {self.task_name} not implemented.")
 
-
-        # this name must be head in order to load pretrained weights
-        # self.head = self._get_head(TASKS.RECONSTRUCTION, None)
-
-        # for horizon in config.forecast_horizons:
-        #     setattr(self, f"fore_head_{horizon}", self._get_head(TASKS.FORECASTING, forecast_horizon=horizon))
-
-        setattr(self, f"fore_head_long", self._get_head(TASKS.FORECASTING, forecast_horizon=config.forecast_horizons[0]))
-        # setattr(self, f"fore_head_short", self._get_head(TASKS.FORECASTING, forecast_horizon=config.forecast_horizons[1]))
-
-        self.classification_head = self._get_head(TASKS.CLASSIFICATION, None)
-
-        # self.emb_head = self._get_head(TASKS.EMBED, None)
         ###################################
 
         # Frozen parameters
@@ -355,7 +260,6 @@ class MOMENT(nn.Module):
             setattr(model_config, 'reparam', True)
             setattr(model_config, 'reparam_dim', 32)
             setattr(model_config, 'no_decoder_self_attn', False)
-            setattr(model_config, 'MPT', self.config.getattr("MPT", False))
             setattr(model_config, 'seq_len', self.config.seq_len)
             setattr(model_config, 'multivariate_projection', self.config.multivariate_projection)
             setattr(model_config, 'visualize_attention', self.config.getattr("visualize_attention", False))
@@ -365,13 +269,9 @@ class MOMENT(nn.Module):
                         ) // self.config.patch_stride_len + 1
             setattr(model_config, 'num_patches', num_patches)
 
-
             if config.getattr("prefix_tuning_multi", False):
                 setattr(model_config, 'prefix_tuning', config.getattr("prefix_tuning", False))
                 transformer_backbone = T5ForConditionalGenerationWithPrefixMulti(model_config)
-
-            elif config.getattr("prefix_tuning", False):
-                transformer_backbone = T5ForConditionalGenerationWithPrefix(model_config)
 
             transformer_backbone = transformer_backbone.from_pretrained(config.transformer_backbone, config=model_config)
 
@@ -414,30 +314,10 @@ class MOMENT(nn.Module):
 
         x_enc = self.tokenizer(x=x_enc)
 
-        #######################################################################
-        if isinstance(self.patch_embedding.value_embedding, MPT):
-
-            # using multitask prompt tuning
-            # use 0 or 1? Used 0 in multivariate prefix tuning
-            # should use 1. https://discuss.huggingface.co/t/clarification-on-the-attention-mask/1538
-            # In multivariate prefix tuning, 1 and 0 are already inverted
-            mask = torch.concatenate([torch.ones(mask.size(0),
-                                                self.patch_len*self.patch_embedding.value_embedding.n_tokens).to(x_enc.device),
-                                        mask], dim=1)
-            input_mask = torch.concatenate([torch.ones(input_mask.size(0),
-                                                        self.patch_len*self.patch_embedding.value_embedding.n_tokens).to(x_enc.device),
-                                            input_mask], dim=1)
-
-            self.patch_embedding.value_embedding.task_name = task_name
-
-        # #######################################################################
 
         # TODO: in embed(), mask is input_mask
         # if classification, mask is 1. what about input_mask?
         enc_in = self.patch_embedding(x_enc, mask=mask) # should I flatten this before MPT? No, MPT should apply to each channel independently
-
-        if self.visualize_mpt:
-            self.mpt_tokens = enc_in[0, 0, :self.patch_embedding.value_embedding.n_tokens].detach().cpu().numpy()
 
         n_patches = enc_in.shape[2]
         enc_in = enc_in.reshape(
@@ -455,7 +335,6 @@ class MOMENT(nn.Module):
             # )
             raise NotImplementedError("Encoder-decoder not implemented for prefix T5.")
         else:
-            # if isinstance(self.patch_embedding.value_embedding, MPT):
             if isinstance(self.encoder, T5StackWithPrefixMulti):
                 outputs = self.encoder(n_channels=n_channels, inputs_embeds=enc_in, attention_mask=attention_mask)
             else:
@@ -479,10 +358,6 @@ class MOMENT(nn.Module):
             illegal_output = None
 
         #######################################################################
-        # if using prompt tuning
-        if isinstance(self.patch_embedding.value_embedding, MPT):
-            dec_out = dec_out[:, :, self.patch_len*self.patch_embedding.value_embedding.n_tokens:]
-
         # get embedding
         input_mask_patch_view = Masking.convert_seq_to_patch_view(
             input_mask, self.patch_len
@@ -520,17 +395,6 @@ class MOMENT(nn.Module):
 
         x_enc = self.tokenizer(x=x_enc)
 
-        #######################################################################
-        if isinstance(self.patch_embedding.value_embedding, MPT):
-            # using prompt tuning
-            input_mask = torch.concatenate([torch.ones(input_mask.size(0),
-                                                       self.patch_len*self.patch_embedding.value_embedding.n_tokens).to(x_enc.device),
-                                            input_mask], dim=1)
-
-            self.patch_embedding.value_embedding.task_name = task_name
-
-        #######################################################################
-
         enc_in = self.patch_embedding(x_enc, mask=torch.ones_like(input_mask))
 
         n_patches = enc_in.shape[2]
@@ -541,7 +405,6 @@ class MOMENT(nn.Module):
         patch_view_mask = Masking.convert_seq_to_patch_view(input_mask, self.patch_len)
         attention_mask = patch_view_mask.repeat_interleave(n_channels, dim=0)
 
-        # if isinstance(self.patch_embedding.value_embedding, MPT):
         if isinstance(self.encoder, T5StackWithPrefixMulti):
             outputs = self.encoder(n_channels=n_channels, inputs_embeds=enc_in, attention_mask=attention_mask)
         else:
@@ -558,10 +421,6 @@ class MOMENT(nn.Module):
         dec_out = self.fore_head(enc_out)  # [batch_size x n_channels x forecast_horizon]
         #######################################################################
         dec_out = self.normalizer(x=dec_out, mode="denorm")
-
-        # # if using prompt tuning TODO: should add this like imputation?
-        # if isinstance(self.patch_embedding.value_embedding, MPT):
-        #     dec_out = dec_out[:, :, self.patch_len*self.patch_embedding.value_embedding.n_tokens:]
 
 
         return TimeseriesOutputs(input_mask=input_mask, forecast=dec_out)
@@ -586,30 +445,9 @@ class MOMENT(nn.Module):
 
         x_enc = self.tokenizer(x=x_enc)
 
-        #######################################################################
-        if isinstance(self.patch_embedding.value_embedding, MPT):
-
-            # using multitask prompt tuning
-            # use 0 or 1? Used 0 in multivariate prefix tuning
-            # should use 1. https://discuss.huggingface.co/t/clarification-on-the-attention-mask/1538
-            # In multivariate prefix tuning, 1 and 0 are already inverted
-            mask = torch.concatenate([torch.ones(mask.size(0),
-                                                self.patch_len*self.patch_embedding.value_embedding.n_tokens).to(x_enc.device),
-                                        mask], dim=1)
-            input_mask = torch.concatenate([torch.ones(input_mask.size(0),
-                                                        self.patch_len*self.patch_embedding.value_embedding.n_tokens).to(x_enc.device),
-                                            input_mask], dim=1)
-
-            self.patch_embedding.value_embedding.task_name = task_name
-
-        # #######################################################################
-
         # TODO: in embed(), mask is input_mask
         # if classification, mask is 1. what about input_mask?
         enc_in = self.patch_embedding(x_enc, mask=input_mask) # should I flatten this before MPT? No, MPT should apply to each channel independently
-
-        if self.visualize_mpt:
-            self.mpt_tokens = enc_in[0, 0, :self.patch_embedding.value_embedding.n_tokens].detach().cpu().numpy()
 
         n_patches = enc_in.shape[2]
         enc_in = enc_in.reshape(
@@ -630,7 +468,6 @@ class MOMENT(nn.Module):
             # )
             raise NotImplementedError("Encoder-decoder not implemented for prefix T5.")
         else:
-            # if isinstance(self.patch_embedding.value_embedding, MPT):
             if isinstance(self.encoder, T5StackWithPrefixMulti):
                 outputs = self.encoder(n_channels=n_channels, inputs_embeds=enc_in, attention_mask=attention_mask)
             else:
@@ -708,7 +545,7 @@ class MOMENTPipeline(MOMENT, PyTorchModelHubMixin):
         config = Namespace(**kwargs["model_kwargs"])
 
         if config.task_name == TASKS.FORECASTING:
-            if not hasattr(config, "forecast_horizons"):
+            if not hasattr(config, "forecast_horizon"):
                 raise ValueError(
                     "forecast_horizon must be specified for long-horizon forecasting."
                 )
@@ -717,15 +554,6 @@ class MOMENTPipeline(MOMENT, PyTorchModelHubMixin):
         if self.new_task_name != TASKS.RECONSTRUCTION:
             self.task_name = self.new_task_name
             # self.head = self._get_head(self.new_task_name)
-
-        ###################################
-        # multi-task prompt tuning
-        if self.config.getattr("MPT", False):
-            self.patch_embedding.value_embedding = MPT(self.patch_embedding.value_embedding,
-                                                        self.config.task_names,
-                                                        n_tokens=self.config.getattr("num_prefix", 2),)
-        ###################################
-
 
 
 def freeze_parameters(model):
