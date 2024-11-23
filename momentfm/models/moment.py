@@ -21,6 +21,10 @@ from momentfm.utils.utils import (
     get_huggingface_model_dimensions,
 )
 
+
+from typing import Optional
+
+
 SUPPORTED_HUGGINGFACE_MODELS = [
     "google/flan-t5-small",
     "google/flan-t5-base",
@@ -69,7 +73,7 @@ class ForecastingHead(nn.Module):
         self.dropout = nn.Dropout(head_dropout)
         self.linear = nn.Linear(head_nf, forecast_horizon)
 
-    def forward(self, x, input_mask: torch.Tensor = None):
+    def forward(self, x, input_mask: Optional[torch.Tensor] = None):
         x = self.flatten(x)
         x = self.linear(x)
         x = self.dropout(x)
@@ -95,7 +99,7 @@ class ClassificationHead(nn.Module):
         else:
             raise ValueError(f"Reduction method {reduction} not implemented. Only 'mean' and 'concat' are supported.")
 
-    def forward(self, x, input_mask: torch.Tensor = None):
+    def forward(self, x, input_mask: Optional[torch.Tensor] = None):
         x = torch.mean(x, dim=1)
         x = self.dropout(x)
         y = self.linear(x)
@@ -112,6 +116,18 @@ class MOMENT(nn.Module):
         self.seq_len = config.seq_len
         self.patch_len = config.patch_len
 
+
+
+        self.categorical_embedding = None
+        if config.categories is not None:
+            self.initialize_categorical_embedding()
+
+
+
+
+
+
+        # NOTE: if data are too similar, this produce large values
         self.normalizer = RevIN(
             num_features=1, affine=config.getattr("revin_affine", False)
         )
@@ -130,15 +146,6 @@ class MOMENT(nn.Module):
         )
         self.mask_generator = Masking(mask_ratio=config.getattr("mask_ratio", 0.0))
         self.encoder = self._get_transformer_backbone(config)
-        ###################################
-        if self.task_name == TASKS.FORECASTING:
-            self.head = self._get_head(TASKS.FORECASTING, forecast_horizon=config.forecast_horizon)
-        elif self.task_name == TASKS.CLASSIFICATION:
-            self.head = self._get_head(TASKS.CLASSIFICATION, None)
-        else:
-            raise NotImplementedError(f"Task {self.task_name} not implemented.")
-
-        ###################################
 
         # Frozen parameters
         self.freeze_embedder = config.getattr("freeze_embedder", True)
@@ -151,6 +158,22 @@ class MOMENT(nn.Module):
             self.encoder = freeze_parameters(self.encoder)
         if self.freeze_head:
             self.head = freeze_parameters(self.head)
+
+
+
+    #######################################################################
+    def initialize_categorical_embedding(self):
+        categories = self.config.categories
+
+        dim = 2
+
+        self.categorical_embedding = nn.ModuleDict(
+            {str(i): nn.Embedding(v, dim) for i, v in categories.items()}
+        )
+        self.config.n_channels = (self.config.n_channels-len(categories)) + len(categories)*dim
+    #######################################################################
+
+
 
     def _update_inputs(
         self, config: Namespace | dict, **kwargs: dict
@@ -243,12 +266,15 @@ class MOMENT(nn.Module):
         # if config.getattr("enable_gradient_checkpointing", True):
         #     transformer_backbone.gradient_checkpointing_enable()
         #     logging.info("Enabling gradient checkpointing.")
+
+        # NOTE: fix this. gradient checkpointing is not working
         if config.getattr("enable_gradient_checkpointing", True):
             from functools import partial
             notfailing_checkpoint = partial(torch.utils.checkpoint.checkpoint, use_reentrant=False)
             torch.utils.checkpoint.checkpoint = notfailing_checkpoint
             transformer_backbone.gradient_checkpointing_enable()
             logging.info("Enabling gradient checkpointing.")
+
 
         #######################################################################
         # prefix tuning
@@ -262,6 +288,7 @@ class MOMENT(nn.Module):
             setattr(model_config, 'no_decoder_self_attn', False)
             setattr(model_config, 'seq_len', self.config.seq_len)
             setattr(model_config, 'multivariate_projection', self.config.multivariate_projection)
+            setattr(model_config, 'agg', self.config.agg)
             setattr(model_config, 'visualize_attention', self.config.getattr("visualize_attention", False))
             setattr(model_config, 'n_channels', self.config.getattr("n_channels", False))
 
@@ -297,9 +324,9 @@ class MOMENT(nn.Module):
     def reconstruction(
         self,
         x_enc: torch.Tensor,
-        input_mask: torch.Tensor = None,
-        mask: torch.Tensor = None,
-        task_name: str = None,
+        input_mask: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
+        task_name: Optional[str] = None,
         **kwargs,
     ) -> TimeseriesOutputs:
         batch_size, n_channels, _ = x_enc.shape
@@ -384,8 +411,8 @@ class MOMENT(nn.Module):
         )
 
     def forecast(
-        self, x_enc: torch.Tensor, input_mask: torch.Tensor = None,
-        task_name: str = None,
+        self, x_enc: torch.Tensor, input_mask: Optional[torch.Tensor] = None,
+        task_name: Optional[str] = None,
         **kwargs
     ) -> TimeseriesOutputs:
         batch_size, n_channels, seq_len = x_enc.shape
@@ -418,7 +445,7 @@ class MOMENT(nn.Module):
         # [batch_size x n_channels x n_patches x d_model]
 
         #######################################################################
-        dec_out = self.fore_head(enc_out)  # [batch_size x n_channels x forecast_horizon]
+        dec_out = self.head(enc_out)  # [batch_size x n_channels x forecast_horizon]
         #######################################################################
         dec_out = self.normalizer(x=dec_out, mode="denorm")
 
@@ -430,18 +457,31 @@ class MOMENT(nn.Module):
     def classify(
         self,
         x_enc: torch.Tensor,
-        input_mask: torch.Tensor = None,
-        reduction: str = "concat",
-        task_name: str = None,
+        input_mask: Optional[torch.Tensor] = None,
+        reduction: Optional[str] = "concat",
+        task_name: Optional[str] = None,
         **kwargs,
     ) -> TimeseriesOutputs:
         batch_size, n_channels, _ = x_enc.shape
 
         if input_mask is None:
-            input_mask = torch.ones((batch_size, seq_len)).to(x_enc.device)
-
-        x_enc = self.normalizer(x=x_enc, mask=input_mask, mode="norm")
+            input_mask = torch.ones((batch_size, self.config.seq_len)).to(x_enc.device)
+        # TODO: why need revin if not outputting time series?
+        # x_enc = self.normalizer(x=x_enc, mask=input_mask, mode="norm")
         x_enc = torch.nan_to_num(x_enc, nan=0, posinf=0, neginf=0)
+
+        if self.categorical_embedding is not None:
+            x_enc_new = []
+            for i in range(n_channels):
+                if str(i) in self.categorical_embedding:
+                    assert (x_enc[:, i, :]%1 == 0).all() # check if all values are integers
+                    x_enc_new.append(self.categorical_embedding[str(i)](x_enc[:, i, :].long()).permute(0, 2, 1))
+                else:
+                    x_enc_new.append(x_enc[:, i, :].unsqueeze(1))
+
+            x_enc = torch.cat(x_enc_new, dim=1)
+            batch_size, n_channels, _ = x_enc.shape
+
 
         x_enc = self.tokenizer(x=x_enc)
 
@@ -492,7 +532,7 @@ class MOMENT(nn.Module):
         else:
             raise NotImplementedError(f"Reduction method {reduction} not implemented.")
 
-        logits = self.classification_head(enc_out, input_mask=input_mask)
+        logits = self.head(enc_out, input_mask=input_mask)
 
         return TimeseriesOutputs(embeddings=enc_out, logits=logits, metadata=reduction)
 
@@ -538,6 +578,9 @@ class MOMENTPipeline(MOMENT, PyTorchModelHubMixin):
         )
         super().__init__(config, **kwargs)
 
+
+
+
     def _validate_model_kwargs(self, **kwargs: dict) -> None:
         kwargs = deepcopy(kwargs)
         kwargs.setdefault("model_kwargs", {"task_name": TASKS.RECONSTRUCTION})
@@ -553,6 +596,16 @@ class MOMENTPipeline(MOMENT, PyTorchModelHubMixin):
     def init(self) -> None: # TODO: what does this do to forecasting task?
         if self.new_task_name != TASKS.RECONSTRUCTION:
             self.task_name = self.new_task_name
+
+        ###################################
+        if self.task_name == TASKS.FORECASTING:
+            self.head = self._get_head(TASKS.FORECASTING, forecast_horizon=self.config.forecast_horizon)
+        elif self.task_name == TASKS.CLASSIFICATION:
+            self.head = self._get_head(TASKS.CLASSIFICATION, None)
+        else:
+            raise NotImplementedError(f"Task {self.task_name} not implemented.")
+        ###################################
+
             # self.head = self._get_head(self.new_task_name)
 
 

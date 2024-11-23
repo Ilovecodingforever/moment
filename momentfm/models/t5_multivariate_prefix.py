@@ -156,15 +156,70 @@ class T5AttentionWithPrefix(T5Attention):
                                                                                     self.shared_prompt_projection['v'](hidden_states_proj))
             # reshape, make it channel x d_kv x time
             attn_output = attn_output.reshape(batch_size_real, seq_length, n_channels, -1).permute(0, 2, 3, 1)
-            shared_prompt_projection_k = self.shared_prompt_projection['linear_key'](attn_output) # bs x channel x d_kv x (num_prefix*n_heads)
-            # shared_prompt_projection = shared_prompt_projection.permu
+            if self.config.agg == 'mlp':
+                shared_prompt_projection_k = self.shared_prompt_projection['agg_key'](attn_output) # bs x channel x d_kv x (num_prefix*n_heads)
+                shared_prompt_projection_v = self.shared_prompt_projection['agg_value'](attn_output)
+
+            elif self.config.agg == 'rnn':
+                # TODO: maybe try transformer instead of rnn
+                # TODO: do something with the padding
+                # self.num_prefix = 1  # NOTE
+                # num_prefix = 1
+
+                # find out the padding index
+                # TODO: might not work for batchsize not 1
+                assert mask.shape[2] == 1
+                arr = torch.squeeze(mask).sum(dim=0)
+
+                arr = torch.where(~arr.bool())[0]
+                if len(arr) == 0:
+                    idx = 0
+                else:
+                    idx = torch.min(arr)
+
+                # apply mask
+                attn_output = attn_output[:, :, :, idx:]
+
+                # TODO: maybe should use hidden state instead of output, just like what you did with llm
+                shared_prompt_projection_k = self.shared_prompt_projection['agg_key'](attn_output.reshape(batch_size, -1, seq_length-idx).permute(0,2,1))[0][:, -1, :].reshape(batch_size_real, n_channels, -1).repeat(1, 1, self.config.num_heads)
+                shared_prompt_projection_v = self.shared_prompt_projection['agg_value'](attn_output.reshape(batch_size, -1, seq_length-idx).permute(0,2,1))[0][:, -1, :].reshape(batch_size_real, n_channels, -1).repeat(1, 1, self.config.num_heads)
+
+            elif self.config.agg == 'mha':
+                # self.num_prefix = 1  # NOTE
+                # num_prefix = 1
+
+                # find out the padding index
+                assert mask.shape[2] == 1
+                arr = torch.squeeze(mask).sum(dim=0)
+
+                arr = torch.where(~arr.bool())[0]
+                if len(arr) == 0:
+                    idx = 0
+                else:
+                    idx = torch.min(arr)
+
+                # apply mask
+                attn_output = attn_output[:, :, :, idx:]
+
+                # this is self attention https://www.geeksforgeeks.org/how-to-use-pytorchs-nnmultiheadattention/#
+                shared_prompt_projection_k = self.shared_prompt_projection['agg_key'](attn_output.reshape(batch_size, -1, seq_length-idx).permute(0,2,1).repeat(1, 1, self.config.num_prefix),#*self.num_heads),
+                                                                                      attn_output.reshape(batch_size, -1, seq_length-idx).permute(0,2,1),
+                                                                                      attn_output.reshape(batch_size, -1, seq_length-idx).permute(0,2,1)
+                                                                                      )[0]
+                # just do a global average pooling
+                # https://keras.io/examples/timeseries/timeseries_classification_transformer/#:~:text=current%20batch.%20A%20common%20way%20to%20achieve%20this%20is%20to%20use%20a%20pooling%20layer.%20For%20this%20example%2C%20a%20GlobalAveragePooling1D%20layer%20is%20sufficient
+                shared_prompt_projection_k = shared_prompt_projection_k.mean(dim=1).reshape(batch_size_real, n_channels, -1).repeat(1, 1, self.config.num_heads)
+
+                shared_prompt_projection_v = self.shared_prompt_projection['agg_value'](attn_output.reshape(batch_size, -1, seq_length-idx).permute(0,2,1).repeat(1, 1, self.config.num_prefix),#*self.num_heads),
+                                                                                        attn_output.reshape(batch_size, -1, seq_length-idx).permute(0,2,1),
+                                                                                        attn_output.reshape(batch_size, -1, seq_length-idx).permute(0,2,1)
+                                                                                        )[0]
+                shared_prompt_projection_v = shared_prompt_projection_v.mean(dim=1).reshape(batch_size_real, n_channels, -1).repeat(1, 1, self.config.num_heads)
 
             # repreat self.config.num_heads times, on last dimension
             shared_prompt_projection_key = shared_prompt_projection_k.reshape(batch_size_real, n_channels, -1, self.num_prefix, self.config.num_heads).permute(0, 4, 1, 3, 2).reshape(batch_size_real, self.config.num_heads, n_channels*self.num_prefix, -1).repeat_interleave(n_channels, dim=0)
             #             # bsz, num_heads, num_prefix, d_kv
             # TODO: now sequence length is n_channels*self.num_prefix. should I project this to something shorter?
-
-            shared_prompt_projection_v = self.shared_prompt_projection['linear_value'](attn_output)
             shared_prompt_projection_value = shared_prompt_projection_v.reshape(batch_size_real, n_channels, -1, self.num_prefix, self.config.num_heads).permute(0, 4, 1, 3, 2).reshape(batch_size_real, self.config.num_heads, n_channels*self.num_prefix, -1).repeat_interleave(n_channels, dim=0)
 
             if self.config.visualize_attention:
@@ -190,16 +245,22 @@ class T5AttentionWithPrefix(T5Attention):
                                                                                     self.shared_prompt_projection['v'](hidden_states_proj))
             # reshape, make it channel x d_kv x time
             attn_output = attn_output.reshape(batch_size_real, seq_length, n_channels, -1).permute(0, 2, 3, 1)
-            shared_prompt_projection_k = self.shared_prompt_projection['linear_key'](attn_output) # bs x channel x d_kv x (num_prefix*n_heads)
-            # shared_prompt_projection = shared_prompt_projection.permu
+
+            if self.config.agg == 'mlp':
+                shared_prompt_projection_k = self.shared_prompt_projection['agg_key'](attn_output) # bs x channel x d_kv x (num_prefix*n_heads)
+                shared_prompt_projection_v = self.shared_prompt_projection['agg_value'](attn_output)
+
+            elif self.config.agg == 'rnn':
+                shared_prompt_projection_k = self.shared_prompt_projection['agg_key'](attn_output)[0][:, -1, :]
+                shared_prompt_projection_v = self.shared_prompt_projection['agg_value'](attn_output)[0][:, -1, :]
 
             # repreat self.config.num_heads times, on last dimension
-            shared_prompt_projection_key = shared_prompt_projection_k.reshape(batch_size_real, n_channels, -1, self.num_prefix, self.config.num_heads).permute(0, 4, 1, 3, 2).reshape(batch_size_real, self.config.num_heads, n_channels*self.num_prefix, -1).repeat_interleave(n_channels, dim=0)
+            shared_prompt_projection_key = shared_prompt_projection_k.reshape(batch_size_real, n_channels, -1, self.num_prefix, self.config.num_heads).permute(0, 4, 1, 3, 2).reshape(batch_size_real, self.config.num_heads, n_channels*self.num_prefix, -1)
+            # shared_prompt_projection_key = shared_prompt_projection_key.repeat_interleave(n_channels, dim=0)
             #             # bsz, num_heads, num_prefix, d_kv
             # TODO: now sequence length is n_channels*self.num_prefix. should I project this to something shorter?
-
-            shared_prompt_projection_v = self.shared_prompt_projection['linear_value'](attn_output)
-            shared_prompt_projection_value = shared_prompt_projection_v.reshape(batch_size_real, n_channels, -1, self.num_prefix, self.config.num_heads).permute(0, 4, 1, 3, 2).reshape(batch_size_real, self.config.num_heads, n_channels*self.num_prefix, -1).repeat_interleave(n_channels, dim=0)
+            shared_prompt_projection_value = shared_prompt_projection_v.reshape(batch_size_real, n_channels, -1, self.num_prefix, self.config.num_heads).permute(0, 4, 1, 3, 2).reshape(batch_size_real, self.config.num_heads, n_channels*self.num_prefix, -1)
+            # shared_prompt_projection_value = shared_prompt_projection_value.repeat_interleave(n_channels, dim=0)
 
             # shared_prompt_projection_key = torch.cat([self.prefix_key, shared_prompt_projection_key], dim=-2)
             # shared_prompt_projection_value = torch.cat([self.prefix_value, shared_prompt_projection_value], dim=-2)
@@ -472,8 +533,26 @@ class T5StackWithPrefixMulti(T5Stack):
             # reshape, make it bs x channel x d_kv x time
             # https://d2l.ai/chapter_attention-mechanisms-and-transformers/multihead-attention.html
 
-            self.shared_prompt_projection_linear_key = nn.Linear(config.num_patches, config.num_prefix*config.num_heads)  # TODO: move this to before attention?
-            self.shared_prompt_projection_linear_value = nn.Linear(config.num_patches, config.num_prefix*config.num_heads)
+            if config.agg == 'mlp':
+                self.shared_prompt_projection_agg_key = nn.Linear(config.num_patches, config.num_prefix*config.num_heads)  # TODO: move this to before attention?
+                self.shared_prompt_projection_agg_value = nn.Linear(config.num_patches, config.num_prefix*config.num_heads)
+            elif config.agg == 'rnn':
+                # TODO: does the dimensions make sense? input is less than output
+                self.shared_prompt_projection_agg_key = nn.RNN(config.d_kv, config.d_kv*config.num_prefix, batch_first=True)
+                self.shared_prompt_projection_agg_value = nn.RNN(config.d_kv, config.d_kv*config.num_prefix, batch_first=True)
+                # self.shared_prompt_projection_agg_key = nn.RNN(config.d_kv, config.d_kv*config.num_prefix*config.num_heads, batch_first=True)
+                # self.shared_prompt_projection_agg_value = nn.RNN(config.d_kv, config.d_kv*config.num_prefix*config.num_heads, batch_first=True)
+            elif config.agg == 'mha':
+                self.shared_prompt_projection_agg_key = nn.MultiheadAttention(config.d_kv*config.num_prefix, 1, kdim=config.d_kv, vdim=config.d_kv,
+                                                                              batch_first=True)
+                self.shared_prompt_projection_agg_value = nn.MultiheadAttention(config.d_kv*config.num_prefix, 1, kdim=config.d_kv, vdim=config.d_kv,
+                                                                                batch_first=True)
+                # self.shared_prompt_projection_agg_key = nn.MultiheadAttention(config.d_kv*config.num_prefix*config.num_heads, 1, kdim=config.d_kv, vdim=config.d_kv,
+                #                                                               batch_first=True)
+                # self.shared_prompt_projection_agg_value = nn.MultiheadAttention(config.d_kv*config.num_prefix*config.num_heads, 1, kdim=config.d_kv, vdim=config.d_kv,
+                #                                                                 batch_first=True)
+            else:
+                raise ValueError('Invalid aggregation type')
 
             # out: bs x channel x d_kv x (num_prefix*n_heads)
             # reshape, make it bs x 1 x 1 x (channel * config.num_prefix) x config.d_kv
@@ -483,8 +562,8 @@ class T5StackWithPrefixMulti(T5Stack):
                 'q': self.shared_prompt_projection_q,
                 'v': self.shared_prompt_projection_v,
                 'mha': self.shared_prompt_projection_mha,
-                'linear_key': self.shared_prompt_projection_linear_key,
-                'linear_value': self.shared_prompt_projection_linear_value,
+                'agg_key': self.shared_prompt_projection_agg_key,
+                'agg_value': self.shared_prompt_projection_agg_value,
             }
 
         if config.multivariate_projection == 'vanilla' or config.multivariate_projection == 'residual':
@@ -550,7 +629,7 @@ class T5StackWithPrefixMulti(T5Stack):
                         layer.EncDecAttention.n_channels = n_channels
 
         # if self.config.prefix_tuning:
-        if self.config.multivariate_projection == 'vanilla' or self.config.multivariate_projection == 'residual': 
+        if self.config.multivariate_projection == 'vanilla' or self.config.multivariate_projection == 'residual':
 
             prefix_key, prefix_value = self.generate_prefix_item(inputs_embeds, self.prompt_embed)
             kwargs['use_cache'] = False

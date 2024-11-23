@@ -74,6 +74,11 @@ class RevIN(nn.Module):
         masked_x = torch.where(mask, x, torch.nan)
         self.mean = torch.nanmean(masked_x, dim=-1, keepdim=True).detach()
         self.stdev = nanstd(masked_x, dim=-1, keepdim=True).detach() + self.eps
+        
+        # NOTE: https://stackoverflow.com/a/54623752/16995731
+        # self.stdev = nanstd(masked_x, dim=-1, keepdim=True).detach()
+        # self.stdev[torch.isclose(self.stdev, torch.zeros_like(self.stdev))] = 1.0
+        
         # self.stdev = torch.sqrt(
         #     torch.var(masked_x, dim=-1, keepdim=True) + self.eps).get_data().detach()
         # NOTE: By default not bessel correction
