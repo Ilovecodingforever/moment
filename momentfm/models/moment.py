@@ -116,18 +116,6 @@ class MOMENT(nn.Module):
         self.seq_len = config.seq_len
         self.patch_len = config.patch_len
 
-
-
-        self.categorical_embedding = None
-        if config.categories is not None:
-            self.initialize_categorical_embedding()
-
-
-
-
-
-
-        # NOTE: if data are too similar, this produce large values
         self.normalizer = RevIN(
             num_features=1, affine=config.getattr("revin_affine", False)
         )
@@ -158,21 +146,6 @@ class MOMENT(nn.Module):
             self.encoder = freeze_parameters(self.encoder)
         if self.freeze_head:
             self.head = freeze_parameters(self.head)
-
-
-
-    #######################################################################
-    def initialize_categorical_embedding(self):
-        categories = self.config.categories
-
-        dim = 2
-
-        self.categorical_embedding = nn.ModuleDict(
-            {str(i): nn.Embedding(v, dim) for i, v in categories.items()}
-        )
-        self.config.n_channels = (self.config.n_channels-len(categories)) + len(categories)*dim
-    #######################################################################
-
 
 
     def _update_inputs(
@@ -262,12 +235,7 @@ class MOMENT(nn.Module):
 
         model_config = transformer_backbone.config
 
-        # https://github.com/huggingface/transformers/issues/21381
-        # if config.getattr("enable_gradient_checkpointing", True):
-        #     transformer_backbone.gradient_checkpointing_enable()
-        #     logging.info("Enabling gradient checkpointing.")
 
-        # NOTE: fix this. gradient checkpointing is not working
         if config.getattr("enable_gradient_checkpointing", True):
             from functools import partial
             notfailing_checkpoint = partial(torch.utils.checkpoint.checkpoint, use_reentrant=False)
@@ -304,15 +272,6 @@ class MOMENT(nn.Module):
 
             transformer_backbone.enable_input_require_grads()
             transformer_backbone = transformer_backbone.encoder
-
-            # check whether the weights is loaded correctly
-            # t5 = T5EncoderModel.from_pretrained(config.transformer_backbone).get_encoder()
-            # for name, param in transformer_backbone.named_parameters():
-            #     if 'prefix' not in name and 'prompt' not in name:
-            #         assert(torch.equal(param, t5.state_dict()[name]))
-
-            # gradient checkpointing for prefix tuning doesn't work:
-            # past_key_value is always None with gradient checkpointing (from T5Stack source code)
         #######################################################################
 
         return transformer_backbone
@@ -341,10 +300,7 @@ class MOMENT(nn.Module):
 
         x_enc = self.tokenizer(x=x_enc)
 
-
-        # TODO: in embed(), mask is input_mask
-        # if classification, mask is 1. what about input_mask?
-        enc_in = self.patch_embedding(x_enc, mask=mask) # should I flatten this before MPT? No, MPT should apply to each channel independently
+        enc_in = self.patch_embedding(x_enc, mask=mask) 
 
         n_patches = enc_in.shape[2]
         enc_in = enc_in.reshape(
@@ -355,11 +311,6 @@ class MOMENT(nn.Module):
         attention_mask = patch_view_mask.repeat_interleave(n_channels, dim=0)
 
         if self.config.transformer_type == "encoder_decoder":
-            # outputs = self.encoder(
-            #     inputs_embeds=enc_in,
-            #     decoder_inputs_embeds=enc_in,
-            #     attention_mask=attention_mask,
-            # )
             raise NotImplementedError("Encoder-decoder not implemented for prefix T5.")
         else:
             if isinstance(self.encoder, T5StackWithPrefixMulti):
@@ -435,8 +386,6 @@ class MOMENT(nn.Module):
         if isinstance(self.encoder, T5StackWithPrefixMulti):
             outputs = self.encoder(n_channels=n_channels, inputs_embeds=enc_in, attention_mask=attention_mask)
         else:
-            # do self.eval, then this is deterministic
-            # https://github.com/huggingface/transformers/issues/695
             outputs = self.encoder(inputs_embeds=enc_in, attention_mask=attention_mask)
 
         # outputs = self.encoder(n_channels=n_channels, inputs_embeds=enc_in, attention_mask=attention_mask)
@@ -466,8 +415,6 @@ class MOMENT(nn.Module):
 
         if input_mask is None:
             input_mask = torch.ones((batch_size, self.config.seq_len)).to(x_enc.device)
-        # TODO: why need revin if not outputting time series?
-        # x_enc = self.normalizer(x=x_enc, mask=input_mask, mode="norm")
         x_enc = torch.nan_to_num(x_enc, nan=0, posinf=0, neginf=0)
 
         if self.categorical_embedding is not None:
@@ -485,9 +432,7 @@ class MOMENT(nn.Module):
 
         x_enc = self.tokenizer(x=x_enc)
 
-        # TODO: in embed(), mask is input_mask
-        # if classification, mask is 1. what about input_mask?
-        enc_in = self.patch_embedding(x_enc, mask=input_mask) # should I flatten this before MPT? No, MPT should apply to each channel independently
+        enc_in = self.patch_embedding(x_enc, mask=input_mask) 
 
         n_patches = enc_in.shape[2]
         enc_in = enc_in.reshape(
@@ -501,11 +446,6 @@ class MOMENT(nn.Module):
             attention_mask = torch.flatten(patch_view_mask, end_dim=-2)
 
         if self.config.transformer_type == "encoder_decoder":
-            # outputs = self.encoder(
-            #     inputs_embeds=enc_in,
-            #     decoder_inputs_embeds=enc_in,
-            #     attention_mask=attention_mask,
-            # )
             raise NotImplementedError("Encoder-decoder not implemented for prefix T5.")
         else:
             if isinstance(self.encoder, T5StackWithPrefixMulti):
@@ -593,7 +533,7 @@ class MOMENTPipeline(MOMENT, PyTorchModelHubMixin):
                     "forecast_horizon must be specified for long-horizon forecasting."
                 )
 
-    def init(self) -> None: # TODO: what does this do to forecasting task?
+    def init(self) -> None:
         if self.new_task_name != TASKS.RECONSTRUCTION:
             self.task_name = self.new_task_name
 
@@ -605,8 +545,6 @@ class MOMENTPipeline(MOMENT, PyTorchModelHubMixin):
         else:
             raise NotImplementedError(f"Task {self.task_name} not implemented.")
         ###################################
-
-            # self.head = self._get_head(self.new_task_name)
 
 
 def freeze_parameters(model):
